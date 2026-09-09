@@ -11,6 +11,7 @@ on:
         options:
           - 'smoke'
           - 'bench'
+          - 'arena'
       depth:
         description: '实验搜索深度'
         required: true
@@ -19,10 +20,20 @@ on:
         options:
           - '2'
           - '3'
+      games:
+        description: 'arena对局数（smoke/bench时忽略）'
+        required: true
+        default: '12'
+        type: choice
+        options:
+          - '4'
+          - '12'
+          - '20'
+          - '40'
       seed:
         description: '随机种子'
         required: true
-        default: '20260914'
+        default: '20260915'
         type: string
 
 permissions:
@@ -30,7 +41,7 @@ permissions:
 
 jobs:
   v8_lab:
-    name: V8 LAB · ${{ inputs.mode }} · 深度 ${{ inputs.depth }}
+    name: V8 LAB · ${{ inputs.mode }} · 深度 ${{ inputs.depth }} · ${{ inputs.games }}局
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -47,8 +58,9 @@ jobs:
         env:
           MODE: ${{ inputs.mode }}
           DEPTH: ${{ inputs.depth }}
+          GAMES: ${{ inputs.games }}
           SEED: ${{ inputs.seed }}
-        run: node trainer/v8_lab.mjs --mode "$MODE" --depth "$DEPTH" --seed "$SEED"
+        run: node trainer/v8_lab.mjs --mode "$MODE" --depth "$DEPTH" --games "$GAMES" --seed "$SEED"
 
       - name: 显示实验摘要
         if: always()
@@ -61,7 +73,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: wudaofang-v8-lab-${{ inputs.mode }}-d${{ inputs.depth }}
+          name: wudaofang-v8-lab-${{ inputs.mode }}-d${{ inputs.depth }}-${{ inputs.games }}g
           path: v8-lab-results/
           if-no-files-found: warn
           retention-days: 30
