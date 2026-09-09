@@ -1,0 +1,31 @@
+{
+  "generation": 4,
+  "name": "Gen4",
+  "rulesVersion": "V2.3-draw",
+  "generatedAt": "2026-09-06T04:25:12.584Z",
+  "sourceTraining": {
+    "games": 200,
+    "depth": 4,
+    "seed": 20260905,
+    "trainerVersion": "deep-train-v5.2-disagreement-screening"
+  },
+  "accepted": true,
+  "selectedCandidate": "数据均衡",
+  "weights": {
+    "material": 80.8132,
+    "mobility": 30,
+    "protected": 4.2116,
+    "pattern": 18.7737,
+    "potential": 5,
+    "center": 8
+  },
+  "promotionTest": {
+    "games": 40,
+    "openingScenarios": 20,
+    "candidateWins": 18,
+    "baselineWins": 15,
+    "draws": 7,
+    "candidateScore": 0.5375,
+    "accepted": true
+  }
+}
