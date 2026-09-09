@@ -8,6 +8,7 @@
   A. 重新实现 5x5 Bitboard 规则核心 + 数字 claimed + make/unmake
   B. 建立 Oracle 裁判 + 全合法着 PVS/Alpha-Beta + TT + Killer/History
      + 真正战术延伸 + 战术静态搜索
+  C. 增加纯搜索器擂台：V8 新搜索 vs Gen4 兼容旧搜索，同一评价、同一规则、成对换边
 
   重要：
   - 这是实验引擎，不会覆盖 data/ai-baseline.json。
@@ -17,7 +18,7 @@
 
 import fs from 'node:fs';
 
-const VERSION='v8-lab-a-b-0.1';
+const VERSION='v8-lab-c-0.2';
 const PHASE={PLACE:0,OPENING:1,MOVE:2,CAPTURE:3,GAMEOVER:4};
 const PHASE_NAME=['place','opening','move','capture','gameover'];
 const N=5;
@@ -459,6 +460,7 @@ function orderMoves(s,root,ctx,ttMove,ply){
 
 function qsearch(s,alpha,beta,root,ctx,noProgress,rep,qLeft,ply,sensitive){
   ctx.qnodes++;ctx.nodes++;
+  if(ctx.nodes>=ctx.nodeLimit||(ctx.deadline&&Date.now()>=ctx.deadline)){ctx.aborted=true;return evalFor(s,root);}
   if(s.winner)return evalFor(s,root);
   let stand=evalFor(s,root);
   if(qLeft<=0)return stand;
@@ -480,6 +482,7 @@ function qsearch(s,alpha,beta,root,ctx,noProgress,rep,qLeft,ply,sensitive){
     if(step.draw){v=0;ctx.drawLeaves++;}
     else v=qsearch(s,alpha,beta,root,ctx,step.np,rep,qLeft-1,ply+1,sensitive||step.sensitive);
     popDraw(step,rep);unmakeMove(s,u);
+    if(ctx.aborted)return evalFor(s,root);
     if(maximizing){
       if(v>best)best=v;if(best>alpha)alpha=best;if(alpha>=beta)break;
     }else{
@@ -492,7 +495,7 @@ function qsearch(s,alpha,beta,root,ctx,noProgress,rep,qLeft,ply,sensitive){
 function ttKey(s,root){return hashState(s)+'|r'+root;}
 function pvs(s,depth,alpha,beta,root,ctx,noProgress,rep,extLeft,ply,sensitive){
   ctx.nodes++;
-  if(ctx.nodes>=ctx.nodeLimit){ctx.aborted=true;return evalFor(s,root);}
+  if(ctx.nodes>=ctx.nodeLimit||(ctx.deadline&&Date.now()>=ctx.deadline)){ctx.aborted=true;return evalFor(s,root);}
   if(s.winner)return evalFor(s,root);
   if(depth<=0)return ctx.useQ?qsearch(s,alpha,beta,root,ctx,noProgress,rep,ctx.qDepth,ply,sensitive):evalFor(s,root);
 
@@ -570,10 +573,11 @@ function searchV8(s,targetDepth,root,opts={}){
   const noProgress=opts.noProgress||0;
   let completed=null,totalNodes=0,totalQ=0,totalExt=0,totalDraw=0;
   const nodeLimit=opts.nodeLimit??8_000_000;
+  const deadline=opts.maxMs?Date.now()+opts.maxMs:0;
   for(let d=1;d<=targetDepth;d++){
     const ctx={
       tt,history,killers,nodes:0,qnodes:0,extensions:0,drawLeaves:0,aborted:false,
-      nodeLimit,useQ:opts.useQ!==false,qDepth:opts.qDepth??2
+      nodeLimit,deadline,useQ:opts.useQ!==false,qDepth:opts.qDepth??2
     };
     const aa=orderMoves(s,root,ctx,completed?.bestCode??-1,0);
     const ranked=[];
@@ -742,12 +746,198 @@ function runBench(seed=20260914,depth=3){
   return rows;
 }
 
+
+// ---------------- V8-C：纯搜索器擂台 ----------------
+// 目的：先不引入 NNUE / Policy / 开局库，只比较“搜索方法”本身。
+// 两边共用同一个 Bitboard 规则核心和 Gen4 正式评价函数，避免规则/评价差异污染结果。
+// Gen4 兼容侧复刻旧搜索的关键特征：硬分支上限 + 普通 Alpha-Beta + TT，无静态战术延伸、无和棋历史感知。
+function cloneStateFast(s){
+  return{
+    blackMask:s.blackMask>>>0,whiteMask:s.whiteMask>>>0,
+    owner:new Uint8Array(s.owner),pid:new Uint8Array(s.pid),
+    nextId1:s.nextId1,nextId2:s.nextId2,
+    claimed1:new Set(s.claimed1),claimed2:new Set(s.claimed2),
+    claimHash1:s.claimHash1>>>0,claimHash2:s.claimHash2>>>0,idHash:s.idHash>>>0,
+    phase:s.phase,turn:s.turn,bonusLeft:s.bonusLeft,captureLeft:s.captureLeft,openingStage:s.openingStage,
+    winner:s.winner,winReason:s.winReason
+  };
+}
+function legacyQuickScore(s,a,root){
+  const actor=s.turn,u=makeMove(s,a);
+  let z=evalFor(s,root);
+  if(a.type==='X')z+=280;
+  if(a.type==='P')z+=CENTER_W[a.to]*4;
+  if(a.type==='M'){
+    z+=(CENTER_W[a.to]-CENTER_W[a.from])*2;
+    if(s.phase===PHASE.CAPTURE&&s.turn===actor)z+=180+s.captureLeft*50;
+  }
+  unmakeMove(s,u);
+  return z;
+}
+function legacyBranchCap(s,depth){
+  if(s.phase===PHASE.PLACE)return depth>=4?7:9;
+  if(s.phase===PHASE.MOVE)return depth>=4?9:12;
+  if(s.phase===PHASE.CAPTURE||s.phase===PHASE.OPENING)return 10;
+  return 12;
+}
+function legacyOrderedActions(s,root,depth){
+  const aa=actions(s);
+  if(aa.length<=1)return aa;
+  const maximizing=s.turn===root;
+  const rows=aa.map(a=>({a,v:legacyQuickScore(s,a,root)}));
+  rows.sort((x,y)=>maximizing?y.v-x.v:x.v-y.v);
+  return rows.slice(0,legacyBranchCap(s,depth)).map(x=>x.a);
+}
+function legacyAB(s,depth,alpha,beta,root,ctx){
+  ctx.nodes++;
+  if(ctx.nodes>=ctx.nodeLimit||(ctx.deadline&&Date.now()>=ctx.deadline)){ctx.aborted=true;return evalFor(s,root);}
+  if(s.winner||depth<=0)return evalFor(s,root);
+  const key=hashState(s)+'|d'+depth+'|r'+root;
+  const old=ctx.tt.get(key),alpha0=alpha,beta0=beta;
+  if(old){
+    if(old.flag==='EXACT')return old.score;
+    if(old.flag==='LOWER')alpha=Math.max(alpha,old.score);
+    else if(old.flag==='UPPER')beta=Math.min(beta,old.score);
+    if(alpha>=beta)return old.score;
+  }
+  const aa=legacyOrderedActions(s,root,depth);
+  if(!aa.length)return evalFor(s,root);
+  const maximizing=s.turn===root;
+  let best=maximizing?-Infinity:Infinity,bestCode=-1;
+  for(const a of aa){
+    const u=makeMove(s,a);
+    const nd=depth-(u.endedTurn?1:0);
+    const v=legacyAB(s,nd,alpha,beta,root,ctx);
+    unmakeMove(s,u);
+    if(ctx.aborted)return evalFor(s,root);
+    if(maximizing){if(v>best){best=v;bestCode=actionCode(a);}if(best>alpha)alpha=best;}
+    else{if(v<best){best=v;bestCode=actionCode(a);}if(best<beta)beta=best;}
+    if(alpha>=beta)break;
+  }
+  if(!ctx.aborted&&Number.isFinite(best)){
+    let flag='EXACT';
+    if(best<=alpha0)flag='UPPER';else if(best>=beta0)flag='LOWER';
+    ctx.tt.set(key,{score:best,flag,bestCode});
+  }
+  return best;
+}
+function searchLegacy(s,targetDepth,root,opts={}){
+  let completed=null,totalNodes=0;
+  const nodeLimit=opts.nodeLimit??120000,deadline=opts.maxMs?Date.now()+opts.maxMs:0;
+  for(let d=1;d<=targetDepth;d++){
+    const ctx={nodes:0,nodeLimit,deadline,aborted:false,tt:new Map()};
+    const aa=legacyOrderedActions(s,root,d),ranked=[];
+    for(const a of aa){
+      const u=makeMove(s,a);
+      const v=legacyAB(s,d-(u.endedTurn?1:0),-Infinity,Infinity,root,ctx);
+      unmakeMove(s,u);
+      ranked.push({a,score:v,code:actionCode(a)});
+      if(ctx.aborted)break;
+    }
+    totalNodes+=ctx.nodes;
+    if(ctx.aborted||ranked.length!==aa.length)break;
+    ranked.sort((x,y)=>y.score-x.score);
+    completed={depth:d,action:ranked[0]?.a||null,bestCode:ranked[0]?.code??-1,score:ranked[0]?.score??evalFor(s,root),ranked};
+  }
+  if(!completed){
+    const aa=legacyOrderedActions(s,root,1),a=aa[0]||null;
+    return{action:a,bestCode:a?actionCode(a):-1,score:evalFor(s,root),depth:0,nodes:totalNodes,aborted:true};
+  }
+  return{...completed,nodes:totalNodes,aborted:false};
+}
+function arenaNodeBudget(depth){
+  if(depth<=2)return 45000;
+  if(depth===3)return 120000;
+  return 220000;
+}
+function arenaTimeBudgetMs(depth){
+  if(depth<=2)return 140;
+  if(depth===3)return 420;
+  return 900;
+}
+function generateArenaScenarios(seed,pairs){
+  const out=[];
+  for(let attempt=0;out.length<pairs&&attempt<pairs*12;attempt++){
+    // 覆盖摆子中后段、满盘过渡、早期走子；同一局面让两台引擎换边各下一盘。
+    const plies=10+((attempt*7)%38);
+    const p=randomPlayout((seed+0x6a09e667+attempt*2654435761)>>>0,plies);
+    if(p.s.winner||actions(p.s).length===0)continue;
+    out.push({
+      id:out.length,plies,phase:PHASE_NAME[p.s.phase],turn:p.s.turn,
+      state:cloneStateFast(p.s),rep:new Map(p.rep),noProgress:p.noProgress,hash:hashState(p.s)
+    });
+  }
+  assert(out.length===pairs,`擂台场景不足：${out.length}/${pairs}`);
+  return out;
+}
+function playArenaGame(sc,v8Side,depth,nodeBudget,timeBudgetMs){
+  const s=cloneStateFast(sc.state),rep=new Map(sc.rep);
+  let noProgress=sc.noProgress||0,actionsPlayed=0,drawReason='',v8Nodes=0,legacyNodes=0,v8Ext=0,v8Q=0;
+  let v8DepthSum=0,v8Calls=0,legacyDepthSum=0,legacyCalls=0;
+  while(!s.winner&&!drawReason&&actionsPlayed<320){
+    const actor=s.turn;
+    let res;
+    if(actor===v8Side){
+      res=searchV8(s,depth,actor,{rep,noProgress,useQ:true,extensions:1,qDepth:2,nodeLimit:nodeBudget,maxMs:timeBudgetMs});
+      v8Nodes+=res.nodes;v8Ext+=res.extensions||0;v8Q+=res.qnodes||0;v8DepthSum+=res.depth||0;v8Calls++;
+    }else{
+      res=searchLegacy(s,depth,actor,{nodeLimit:nodeBudget,maxMs:timeBudgetMs});
+      legacyNodes+=res.nodes;legacyDepthSum+=res.depth||0;legacyCalls++;
+    }
+    let a=res.action;
+    if(!a){const aa=actions(s);a=aa[0]||null;}
+    if(!a)break;
+    const u=makeMove(s,a),step=pushDraw(null,a,s,u,noProgress,rep);
+    noProgress=step.np;actionsPlayed++;
+    // 实战推进：历史永久保留，不 popDraw、不 unmake。
+    if(step.draw)drawReason=noProgress>=100?'no-progress':'threefold';
+  }
+  if(!s.winner&&!drawReason&&actionsPlayed>=320)drawReason='safety-cap';
+  let result=0;
+  if(s.winner)result=s.winner===v8Side?1:-1;
+  return{
+    result,winner:s.winner||0,drawReason,actions:actionsPlayed,v8Side,
+    nodes:{v8:v8Nodes,legacy:legacyNodes},extensions:v8Ext,qnodes:v8Q,
+    avgDepth:{v8:v8Calls?Number((v8DepthSum/v8Calls).toFixed(3)):0,legacy:legacyCalls?Number((legacyDepthSum/legacyCalls).toFixed(3)):0}
+  };
+}
+function runArena(seed,depth,games){
+  games=Math.max(4,Math.floor(games/2)*2);
+  const pairs=games/2,nodeBudget=arenaNodeBudget(depth),timeBudgetMs=arenaTimeBudgetMs(depth),scenarios=generateArenaScenarios(seed,pairs);
+  const rows=[];let v8Wins=0,legacyWins=0,draws=0,safety=0,totalV8Nodes=0,totalLegacyNodes=0,totalExt=0,totalQ=0;
+  let v8Black={w:0,l:0,d:0},v8White={w:0,l:0,d:0};
+  const t0=Date.now();
+  for(const sc of scenarios){
+    for(const v8Side of [1,2]){
+      const g=playArenaGame(sc,v8Side,depth,nodeBudget,timeBudgetMs);
+      if(g.result>0){v8Wins++;(v8Side===1?v8Black:v8White).w++;}
+      else if(g.result<0){legacyWins++;(v8Side===1?v8Black:v8White).l++;}
+      else{draws++;(v8Side===1?v8Black:v8White).d++;}
+      if(g.drawReason==='safety-cap')safety++;
+      totalV8Nodes+=g.nodes.v8;totalLegacyNodes+=g.nodes.legacy;totalExt+=g.extensions;totalQ+=g.qnodes;
+      rows.push({scenario:sc.id,plies:sc.plies,phase:sc.phase,hash:sc.hash,...g});
+      console.log(`[v8-lab] arena ${rows.length}/${games}：V8${v8Side===1?'黑':'白'} ${g.result>0?'胜':g.result<0?'负':'和'}；动作${g.actions}；V8深度${g.avgDepth.v8} / 旧深度${g.avgDepth.legacy}`);
+    }
+  }
+  const score=(v8Wins+0.5*draws)/games;
+  return{
+    version:VERSION,mode:'arena',seed,depth,games,pairs,nodeBudget,timeBudgetMs,
+    v8Wins,legacyWins,draws,v8Score:Number(score.toFixed(4)),
+    v8Black,v8White,safetyCaps:safety,
+    totalNodes:{v8:totalV8Nodes,legacy:totalLegacyNodes},v8Extensions:totalExt,v8QNodes:totalQ,
+    elapsedMs:Date.now()-t0,
+    scenarios:scenarios.map(x=>({id:x.id,plies:x.plies,phase:x.phase,turn:x.turn,hash:x.hash})),gamesDetail:rows,
+    interpretation:'实验擂台：同规则、同Gen4评价、同目标深度，并给两边相同的单次搜索时间/节点上限；只比较V8新搜索与Gen4兼容旧搜索。不是Gen5正式晋级赛。'
+  };
+}
+
 function parseArgs(){
-  const a=process.argv.slice(2),out={mode:'smoke',depth:2,seed:20260914};
+  const a=process.argv.slice(2),out={mode:'smoke',depth:2,seed:20260914,games:12};
   for(let i=0;i<a.length;i++){
     if(a[i]==='--mode')out.mode=a[++i];
     else if(a[i]==='--depth')out.depth=Math.max(1,Math.min(4,Number(a[++i])||2));
     else if(a[i]==='--seed')out.seed=(Number(a[++i])||20260914)>>>0;
+    else if(a[i]==='--games')out.games=Math.max(4,Math.min(80,Number(a[++i])||12));
   }
   return out;
 }
@@ -799,6 +989,25 @@ try{
     const bench=runBench(cfg.seed,cfg.depth);
     writeJson('bench.json',{version:VERSION,depth:cfg.depth,seed:cfg.seed,bench});
     console.log(JSON.stringify(bench,null,2));
+  }else if(cfg.mode==='arena'){
+    const arena=runArena(cfg.seed,cfg.depth,cfg.games);
+    writeJson('arena.json',arena);
+    writeSummary([
+      '# 五道方 V8-C 纯搜索器实验擂台','',
+      `- V8版本：${VERSION}`,
+      `- 对局：${arena.games}盘（${arena.pairs}个场景，每个场景成对换边）`,
+      `- 深度目标：${arena.depth}；单次搜索时间上限：${arena.timeBudgetMs}ms；每次迭代节点上限：${arena.nodeBudget}`,
+      `- V8：${arena.v8Wins}胜；Gen4兼容旧搜索：${arena.legacyWins}胜；和棋：${arena.draws}`,
+      `- **V8得分率：${(arena.v8Score*100).toFixed(1)}%**`,
+      `- V8执黑：${arena.v8Black.w}胜/${arena.v8Black.l}负/${arena.v8Black.d}和`,
+      `- V8执白：${arena.v8White.w}胜/${arena.v8White.l}负/${arena.v8White.d}和`,
+      `- V8真实战术延伸：${arena.v8Extensions}次；静态战术节点：${arena.v8QNodes}`,
+      `- 节点：V8 ${arena.totalNodes.v8} / 旧搜索 ${arena.totalNodes.legacy}`,
+      `- safety-cap：${arena.safetyCaps}`,
+      `- 耗时：${(arena.elapsedMs/1000).toFixed(1)}秒`,'',
+      '> 这不是Gen5晋级赛。双方使用同一Gen4评价与同一规则，并使用相同搜索时间/节点上限；本实验不会修改正式基线。'
+    ]);
+    console.log(`[v8-lab] ARENA DONE：V8 ${arena.v8Wins}胜 / 旧搜索 ${arena.legacyWins}胜 / ${arena.draws}和；得分率 ${(arena.v8Score*100).toFixed(1)}%`);
   }else{
     throw new Error('未知 mode：'+cfg.mode);
   }
