@@ -1,14 +1,17 @@
 {
-  "version": "opening-book-v4",
+  "version": "opening-book-v5",
   "rulesVersion": "V2.3-draw",
-  "generatedAt": "2026-09-06T01:04:06.256Z",
+  "generatedAt": "2026-09-09T08:45:32.786Z",
   "baselineWeights": {
-    "material": 80,
+    "material": 80.8132,
     "mobility": 30,
-    "protected": 0,
-    "pattern": 20.0257,
+    "protected": 4.2116,
+    "pattern": 18.7737,
     "potential": 5,
-    "center": 8
+    "center": 8,
+    "threat": 0,
+    "fork": 0,
+    "constraint": 0
   },
   "positions": [
     {
@@ -2382,7 +2385,7 @@
           "wins": 7,
           "draws": 3,
           "losses": 3,
-          "evalSum": 2951.390000000001,
+          "evalSum": 2951.39,
           "depthSum": 52,
           "score": 0.6538,
           "avgSearchScore": 227.03,
@@ -12388,7 +12391,7 @@
           "draws": 1,
           "losses": 1,
           "evalSum": -631.5,
-          "depthSum": 11,
+          "depthSum": 11.01,
           "score": 0.5,
           "avgSearchScore": -210.5,
           "avgSearchDepth": 3.67
