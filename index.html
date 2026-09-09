@@ -1,0 +1,876 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#efe4cf">
+<title>五道方 · 人机对战 V2.3</title>
+<style>
+:root{
+  --bg:#efe4cf;--panel:#fff9ee;--ink:#28231d;--muted:#776c5e;--line:#4c3d2b;
+  --black:#181818;--white:#f4f1e9;--accent:#9b5d22;--green:#2f7a42;--red:#b13f35;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+body{min-height:100vh}
+.app{max-width:720px;margin:auto;padding:14px 12px 40px}
+.top{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px}
+h1{font-size:24px;margin:0}
+.small{font-size:12px;color:var(--muted)}
+.card{background:var(--panel);border:1px solid #d8c6aa;border-radius:18px;padding:12px;margin:10px 0;box-shadow:0 4px 18px rgba(79,54,24,.06)}
+.status{font-size:17px;font-weight:750;line-height:1.45}
+.sub{font-size:13px;color:var(--muted);margin-top:4px;line-height:1.5}
+.controls{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+button,select{font:inherit}
+.btn,select{border:1px solid #baa487;background:#fffdf8;color:var(--ink);border-radius:11px;padding:9px 11px}
+.btn.primary{background:#2b2824;color:#fff;border-color:#2b2824}
+.btn:disabled{opacity:.45}
+.board-shell{padding:10px 8px 14px}
+.board{
+  position:relative;width:min(92vw,560px);aspect-ratio:1;margin:auto;
+  touch-action:manipulation;user-select:none;
+}
+.grid-h,.grid-v{position:absolute;background:var(--line);z-index:0;border-radius:2px}
+.grid-h{height:2px;left:8%;right:8%}
+.grid-v{width:2px;top:8%;bottom:8%}
+.pt{
+  position:absolute;width:46px;height:46px;border:0;background:transparent;transform:translate(-50%,-50%);
+  border-radius:50%;z-index:3;padding:0
+}
+.pt::after{
+  content:"";position:absolute;left:50%;top:50%;width:9px;height:9px;border-radius:50%;
+  background:var(--line);transform:translate(-50%,-50%)
+}
+.pt.black::after,.pt.white::after{
+  width:31px;height:31px;border:2px solid #171717;box-shadow:0 2px 5px rgba(0,0,0,.22)
+}
+.pt.black::after{background:var(--black)}
+.pt.white::after{background:var(--white)}
+.pt.selected::before{
+  content:"";position:absolute;inset:2px;border:3px solid #d08325;border-radius:50%
+}
+.pt.protected::before{
+  content:"";position:absolute;inset:1px;border:3px solid var(--green);border-radius:50%
+}
+.pt.capturable::before{
+  content:"";position:absolute;inset:0;border:3px dashed var(--red);border-radius:50%
+}
+.pt.ai-last-to{outline:3px solid #2878d0;outline-offset:-3px}
+.pt.ai-last-from{box-shadow:inset 0 0 0 2px #d08325}
+.pt.ai-last-capture{outline:3px dashed #b13f35;outline-offset:-3px}
+.pt.ai-last-capture::before{content:"×";position:absolute;inset:-7px;display:grid;place-items:center;color:#b13f35;font-size:34px;font-weight:900;z-index:6;text-shadow:0 1px 0 #fff}
+.pt.replay-to{outline:3px solid #2878d0;outline-offset:-3px}
+.pt.replay-from{box-shadow:inset 0 0 0 2px #d08325}
+.pt.replay-capture{outline:3px dashed #b13f35;outline-offset:-3px}
+.pt.replay-capture::before{content:"×";position:absolute;inset:-7px;display:grid;place-items:center;color:#b13f35;font-size:34px;font-weight:900;z-index:6}
+.coord{
+  position:absolute;font-size:10px;color:#9b8b76;z-index:1;pointer-events:none
+}
+.legend{display:flex;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:8px}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;vertical-align:-1px;margin-right:4px}
+.dot.g{border:2px solid var(--green)}
+.dot.r{border:2px dashed var(--red)}
+.log{white-space:pre-wrap;max-height:180px;overflow:auto;font-size:12.5px;line-height:1.6;background:#f6ecdc;border-radius:12px;padding:9px}
+.badge{display:inline-block;padding:3px 7px;border-radius:999px;background:#eee1cf;font-size:12px;margin-right:5px}
+.ai-thinking{animation:pulse 1s infinite alternate}
+@keyframes pulse{from{opacity:.55}to{opacity:1}}
+details{font-size:13px;line-height:1.7}
+summary{font-weight:700;cursor:pointer}
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#211f1c;color:#fff;padding:8px 13px;border-radius:999px;opacity:0;pointer-events:none;transition:.18s;z-index:10;font-size:13px}
+.toast.show{opacity:1}
+.score-now{margin-top:6px;font-size:13px;font-weight:750;color:#5b4a37}
+.replay-bar{display:none;margin-top:10px;padding:9px;border:1px solid #d8c6aa;border-radius:12px;background:#fffdf8}
+.replay-bar.show{display:block}
+.replay-controls{display:flex;gap:7px;flex-wrap:wrap;margin-top:7px}
+.replay-info{font-size:12.5px;line-height:1.55;color:#5d5144}
+.eval-wrap{margin-top:9px;padding:8px;border-radius:12px;background:#f6ecdc}
+.eval-title{font-size:12px;color:var(--muted);margin-bottom:4px}
+#evalChart{display:block;width:100%;height:86px}
+.end-overlay{position:fixed;inset:0;background:rgba(24,20,16,.48);display:none;align-items:center;justify-content:center;padding:20px;z-index:50}
+.end-overlay.show{display:flex}
+.end-card{width:min(92vw,420px);background:#fff9ee;border:1px solid #d8c6aa;border-radius:22px;padding:24px 18px;text-align:center;box-shadow:0 18px 50px rgba(0,0,0,.25)}
+.end-title{font-size:30px;font-weight:900;line-height:1.25}
+.end-sub{margin-top:8px;color:var(--muted);line-height:1.55}
+.end-actions{display:flex;gap:10px;justify-content:center;margin-top:18px;flex-wrap:wrap}
+@media (max-width:420px){
+  .app{padding-left:8px;padding-right:8px}
+  .card{border-radius:15px}
+  .pt{width:42px;height:42px}
+  .pt.black::after,.pt.white::after{width:28px;height:28px}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="top">
+    <div>
+      <h1>五道方</h1>
+      <div class="small">五大方 · 单机人机版 V2.3</div>
+    </div>
+    <button class="btn" id="rulesBtn">规则</button>
+  </div>
+
+  <div class="card">
+    <div id="status" class="status">准备中…</div>
+    <div id="sub" class="sub"></div>
+    <div id="lastAi" class="sub" style="font-weight:700;color:#355c8a"></div>
+    <div id="scoreNow" class="score-now">局面评分：0.0 均势</div>
+    <div class="controls">
+      <label>我执
+        <select id="sideSel">
+          <option value="1">黑棋（先手）</option>
+          <option value="2">白棋（后手）</option>
+        </select>
+      </label>
+      <label>电脑
+        <select id="levelSel">
+          <option value="1">1级 · 快速</option>
+          <option value="2" selected>2级 · 普通</option>
+          <option value="3">3级 · 强</option>
+          <option value="4">4级 · 极强</option>
+        </select>
+      </label>
+      <button class="btn primary" id="newBtn">新局</button>
+      <button class="btn" id="undoBtn">悔棋</button>
+      <button class="btn" id="replayBtn">复盘</button>
+    </div>
+  </div>
+
+  <div class="card board-shell">
+    <div id="board" class="board" aria-label="五道方棋盘"></div>
+    <div class="legend">
+      <span><i class="dot g"></i>受保护棋子</span>
+      <span><i class="dot r"></i>当前可掐</span>
+      <span>蓝圈 = 电脑本回合落点/终点</span>
+      <span>橙色内圈 = 电脑走棋起点</span>
+      <span>红色× = 电脑刚掐掉的棋子</span>
+      <span>橙圈 = 已选棋子</span>
+    </div>
+    <div id="replayBar" class="replay-bar">
+      <div id="replayInfo" class="replay-info"></div>
+      <div class="replay-controls">
+        <button class="btn" id="prevReplay">◀ 上一步</button>
+        <button class="btn" id="nextReplay">下一步 ▶</button>
+        <button class="btn" id="exitReplay">退出复盘</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div><span class="badge" id="countB">黑 0</span><span class="badge" id="countW">白 0</span><span class="badge" id="nodes">AI 0 节点</span></div>
+    <div class="eval-wrap"><div class="eval-title">优势走势（上方=黑优，下方=白优）</div><canvas id="evalChart" width="640" height="150"></canvas></div>
+    <div id="log" class="log" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
+    <details>
+      <summary>V2.3 已实现的规则</summary>
+      <p>棋盘为 5×5 的25个点。放子阶段轮流落子；成“一方/三步/四步”奖励再放1子，“五龙/一溜”奖励再放2子，多种棋型同一步成立时奖励相加。</p>
+      <p><b>三步、四步：</b>不是任意连续3/4子，而是斜着成线且两头都必须“到外框”。三步只认 A3-B2-C1、A3-B4-C5、C1-D2-E3、C5-D4-E3；四步只认 A2-B3-C4-D5、A4-B3-C2-D1、B1-C2-D3-E4、B5-C4-D3-E2。棋盘中间连续3/4子不算。</p>
+      <p><b>一方：</b>相邻小正方形四角；<b>五龙：</b>两条5点大斜线；<b>一溜：</b>内部三横或内部三竖完整5子，最外四边不算。</p>
+      <p>棋盘放满后：<b>后手先掐先手一个散子 → 先手再掐后手一个散子 → 后手先走 → 先手再走。</b></p>
+      <p>走棋一次只能横/竖移动到相邻空点。走后形成新的有效棋型即可掐子，数量按奖励相加；处于有效棋型中的棋子不能被掐。若额度大于可掐散子数量，只掐能掐的，剩余额度作废。</p>
+      <p>同一批棋子以同一位置顺序恢复成以前已经奖励过的棋型，不再次奖励；换棋子或换位置后重新成型可以再次奖励。</p>
+      <p><b>掐不动：</b>有合法散子就必须掐；若没有任何合法散子，自动跳过，剩余额度作废，不判负。<b>走不动：</b>轮到正常走棋却没有任何合法走法，立即“困弊”判负。</p>
+      <p><b>和棋：</b>同一个完整走棋局面（棋子位置、轮到哪一方、同一批棋子的已领奖励历史均相同）第3次出现，判和；或者双方合计连续100次正常走棋期间没有掐子、也没有形成新的有效棋型奖励，判和。一旦发生掐子或形成新的有效棋型奖励，100步计数清零。</p>
+    </details>
+  </div>
+</div>
+<div id="toast" class="toast"></div>
+<div id="endOverlay" class="end-overlay" role="dialog" aria-modal="true">
+  <div class="end-card">
+    <div id="endTitle" class="end-title"></div>
+    <div id="endSub" class="end-sub"></div>
+    <div class="end-actions">
+      <button class="btn primary" id="againBtn">再来一局</button>
+      <button class="btn" id="reviewBtn">查看棋局</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+'use strict';
+const N=5, HUMAN_DEFAULT=1;
+const idx=(r,c)=>r*N+c, rc=i=>[Math.floor(i/N),i%N], inb=(r,c)=>r>=0&&r<N&&c>=0&&c<N;
+const coord=i=>String.fromCharCode(65+Math.floor(i/N))+(i%N+1);
+
+function uniqSegments(arr){
+  const m=new Map();
+  for(const a of arr){ const k=[...a].sort((x,y)=>x-y).join(','); if(!m.has(k))m.set(k,a); }
+  return [...m.values()];
+}
+// 三步/四步：只认斜线，且两个端点都必须落在棋盘外框上。
+// 三步共4条：上↔左、上↔右、左↔下、右↔下。
+const T3=[
+  [idx(0,2),idx(1,1),idx(2,0)], // A3-B2-C1
+  [idx(0,2),idx(1,3),idx(2,4)], // A3-B4-C5
+  [idx(2,0),idx(3,1),idx(4,2)], // C1-D2-E3
+  [idx(2,4),idx(3,3),idx(4,2)]  // C5-D4-E3
+];
+// 四步共4条：同样必须斜着从一侧外框连到另一侧外框。
+const T4=[
+  [idx(0,1),idx(1,2),idx(2,3),idx(3,4)], // A2-B3-C4-D5
+  [idx(0,3),idx(1,2),idx(2,1),idx(3,0)], // A4-B3-C2-D1
+  [idx(1,0),idx(2,1),idx(3,2),idx(4,3)], // B1-C2-D3-E4
+  [idx(1,4),idx(2,3),idx(3,2),idx(4,1)]  // B5-C4-D3-E2
+];
+const TSQ=[];
+for(let r=0;r<4;r++)for(let c=0;c<4;c++)TSQ.push([idx(r,c),idx(r,c+1),idx(r+1,c+1),idx(r+1,c)]);
+const TDR=[
+  [idx(0,0),idx(1,1),idx(2,2),idx(3,3),idx(4,4)],
+  [idx(0,4),idx(1,3),idx(2,2),idx(3,1),idx(4,0)]
+];
+const TLI=[];
+for(let r=1;r<=3;r++)TLI.push([0,1,2,3,4].map(c=>idx(r,c)));
+for(let c=1;c<=3;c++)TLI.push([0,1,2,3,4].map(r=>idx(r,c)));
+
+function sameCellsContained(small,big){return small.every(x=>big.includes(x))}
+function rawPatterns(board,p){
+  const mine=a=>a.every(i=>board[i]&&board[i].p===p);
+  const out=[];
+  const li=TLI.filter(mine);
+  for(const a of TSQ) if(mine(a)) out.push({type:'一方',score:1,cells:a});
+  for(const a of TDR) if(mine(a)) out.push({type:'五龙',score:2,cells:a});
+  for(const a of li) out.push({type:'一溜',score:2,cells:a});
+  const fours=T4.filter(mine);
+  for(const a of fours){
+    if(!li.some(L=>sameCellsContained(a,L))) out.push({type:'四步',score:1,cells:a});
+  }
+  const threes=T3.filter(mine);
+  for(const a of threes){
+    if(!li.some(L=>sameCellsContained(a,L)) && !fours.some(L=>sameCellsContained(a,L)))
+      out.push({type:'三步',score:1,cells:a});
+  }
+  return out;
+}
+function sigOf(board,pat){
+  const ordered=pat.cells.map(i=>board[i]?.id||0).join('-');
+  return pat.type+'@'+pat.cells.join('.')+'#'+ordered;
+}
+function protectedSet(board,p){
+  const s=new Set(); rawPatterns(board,p).forEach(q=>q.cells.forEach(i=>s.add(i))); return s;
+}
+function newPatterns(state,p){
+  const claimed=new Set(state.claimed[p]);
+  return rawPatterns(state.board,p).filter(q=>!claimed.has(sigOf(state.board,q)));
+}
+function cloneState(s){
+  return {
+    board:s.board.map(x=>x?{p:x.p,id:x.id}:null),
+    nextId:{1:s.nextId[1],2:s.nextId[2]},
+    claimed:{1:[...s.claimed[1]],2:[...s.claimed[2]]},
+    phase:s.phase,turn:s.turn,bonusLeft:s.bonusLeft,captureLeft:s.captureLeft,
+    openingStage:s.openingStage,winner:s.winner,winReason:s.winReason||'',lastEvent:s.lastEvent||'',
+    drawReason:s.drawReason||'',noProgressMoves:s.noProgressMoves||0,repCounts:s.repCounts?{...s.repCounts}:{}
+  };
+}
+function counts(board,p){let n=0;for(const x of board)if(x?.p===p)n++;return n}
+function legalMoves(board,p){
+  const out=[];
+  for(let i=0;i<25;i++) if(board[i]?.p===p){
+    const [r,c]=rc(i);
+    for(const [dr,dc] of [[1,0],[-1,0],[0,1],[0,-1]]){
+      const r2=r+dr,c2=c+dc;
+      if(inb(r2,c2)&&!board[idx(r2,c2)]) out.push({type:'move',from:i,to:idx(r2,c2)});
+    }
+  }
+  return out;
+}
+function looseTargets(board,targetP){
+  const prot=protectedSet(board,targetP), a=[];
+  for(let i=0;i<25;i++) if(board[i]?.p===targetP&&!prot.has(i)) a.push(i);
+  return a;
+}
+function checkTerminal(s){
+  if(s.winner)return;
+  if(counts(s.board,1)===0){s.winner=2;s.winReason='captured';s.phase='gameover';return}
+  if(counts(s.board,2)===0){s.winner=1;s.winReason='captured';s.phase='gameover';return}
+  if(s.phase==='move' && legalMoves(s.board,s.turn).length===0){
+    s.winner=3-s.turn;s.winReason='stuck';s.phase='gameover';
+  }
+}
+function legalActions(s){
+  if(s.phase==='gameover')return[];
+  if(s.phase==='place'){
+    const a=[];for(let i=0;i<25;i++)if(!s.board[i])a.push({type:'place',to:i});return a;
+  }
+  if(s.phase==='opening'){
+    const target=3-s.turn, t=looseTargets(s.board,target);
+    return t.length?t.map(i=>({type:'capture',to:i,opening:true})):[{type:'pass',opening:true}];
+  }
+  if(s.phase==='move') return legalMoves(s.board,s.turn);
+  if(s.phase==='capture'){
+    const target=3-s.turn,t=looseTargets(s.board,target);
+    return t.length?t.map(i=>({type:'capture',to:i})):[{type:'pass'}];
+  }
+  return[];
+}
+function applyAction(s0,a){
+  const s=cloneState(s0), p=s.turn;
+  s.lastEvent='';
+  if(a.type==='place'){
+    const wasBonus=s.bonusLeft>0;
+    if(wasBonus)s.bonusLeft--;
+    s.board[a.to]={p,id:s.nextId[p]++};
+    const np=newPatterns(s,p);
+    let gain=0;
+    for(const q of np){s.claimed[p].push(sigOf(s.board,q));gain+=q.score}
+    s.bonusLeft+=gain;
+    s.lastEvent=`${p===1?'黑':'白'}放 ${coord(a.to)}${np.length?'，成'+np.map(x=>x.type).join('+')+'，加放'+gain:''}`;
+    if(s.board.every(Boolean)){
+      s.phase='opening';s.turn=2;s.openingStage=0;s.bonusLeft=0;
+    }else if(s.bonusLeft===0){
+      s.turn=3-p;
+    }
+  }else if(a.type==='capture'&&s.phase==='opening'){
+    if(a.to!=null)s.board[a.to]=null;
+    if(s.openingStage===0){
+      s.lastEvent=`后手${a.to!=null?'先掐 '+coord(a.to):'无散子可掐'}`;
+      s.openingStage=1;s.turn=1;
+    }else{
+      s.lastEvent=`先手${a.to!=null?'再掐 '+coord(a.to):'无散子可掐'}，后手开始走`;
+      s.phase='move';s.turn=2;s.openingStage=2;
+      checkTerminal(s);
+    }
+  }else if(a.type==='pass'&&s.phase==='opening'){
+    if(s.openingStage===0){s.openingStage=1;s.turn=1;s.lastEvent='后手无散子可掐，跳过';}
+    else{s.phase='move';s.turn=2;s.openingStage=2;s.lastEvent='先手无散子可掐，后手开始走';checkTerminal(s);}
+  }else if(a.type==='move'){
+    s.board[a.to]=s.board[a.from];s.board[a.from]=null;
+    const np=newPatterns(s,p);
+    let gain=0;
+    for(const q of np){s.claimed[p].push(sigOf(s.board,q));gain+=q.score}
+    s.lastEvent=`${p===1?'黑':'白'} ${coord(a.from)}→${coord(a.to)}${np.length?'，成'+np.map(x=>x.type).join('+')+'，可掐'+gain:''}`;
+    if(gain>0 && looseTargets(s.board,3-p).length>0){
+      s.phase='capture';s.captureLeft=gain;
+    }else{
+      s.phase='move';s.captureLeft=0;s.turn=3-p;checkTerminal(s);
+    }
+  }else if(a.type==='capture'&&s.phase==='capture'){
+    if(a.to!=null)s.board[a.to]=null;
+    s.captureLeft--;
+    s.lastEvent=`${p===1?'黑':'白'}掐 ${coord(a.to)}`;
+    checkTerminal(s);
+    if(!s.winner){
+      const more=looseTargets(s.board,3-p);
+      if(s.captureLeft<=0||more.length===0){
+        s.captureLeft=0;s.phase='move';s.turn=3-p;checkTerminal(s);
+      }
+    }
+  }else if(a.type==='pass'&&s.phase==='capture'){
+    s.captureLeft=0;s.phase='move';s.turn=3-p;s.lastEvent='无散子可掐，剩余额度作废';checkTerminal(s);
+  }
+  return s;
+}
+
+let human=HUMAN_DEFAULT, ai=2, selected=null, thinking=false, worker=null, analysisWorker=null, undoStack=[], lastNodes=0;
+let lastAiTurn=[], moveRecords=[], recordSeq=0, replayMode=false, replayIndex=-1, endModalShown=false;
+let state=newState();
+
+function newState(){
+  return {
+    board:Array(25).fill(null),nextId:{1:1,2:1},claimed:{1:[],2:[]},phase:'place',turn:1,
+    bonusLeft:0,captureLeft:0,openingStage:0,winner:0,winReason:'',lastEvent:'',
+    drawReason:'',noProgressMoves:0,repCounts:{}
+  };
+}
+function repetitionKeyMain(s){
+  const board=s.board.map(x=>x?`${x.p}:${x.id}`:'0').join(',');
+  const c1=[...s.claimed[1]].sort().join('|');
+  const c2=[...s.claimed[2]].sort().join('|');
+  return board+`#turn=${s.turn}#c1=${c1}#c2=${c2}`;
+}
+function updateDrawRules(before,a){
+  if(state.winner||state.drawReason)return;
+
+  const beforeClaims=before.claimed[1].length+before.claimed[2].length;
+  const afterClaims=state.claimed[1].length+state.claimed[2].length;
+
+  // “100步无进展”只统计正式走棋动作；掐子或形成新的有效棋型奖励都会清零。
+  if(a.type==='capture'){
+    state.noProgressMoves=0;
+  }else if(a.type==='move'){
+    state.noProgressMoves=afterClaims>beforeClaims?0:(state.noProgressMoves||0)+1;
+  }
+
+  // 只在完整的正常走棋回合起点统计三次重复，避免把掐子过程中的中间状态算进去。
+  if(!state.winner&&state.phase==='move'){
+    const key=repetitionKeyMain(state);
+    const times=(state.repCounts[key]||0)+1;
+    state.repCounts[key]=times;
+    if(times>=3){
+      state.drawReason='threefold';
+      state.phase='gameover';
+      state.lastEvent='同一完整局面第3次出现，和棋';
+    }else if(state.noProgressMoves>=100){
+      state.drawReason='no-progress';
+      state.phase='gameover';
+      state.lastEvent='连续100次正常走棋无掐子、无新棋型奖励，和棋';
+    }
+  }
+}
+function snap(){return JSON.stringify(state)}
+function saveHistory(){undoStack.push({state:snap(),recordLen:moveRecords.length});if(undoStack.length>200)undoStack.shift()}
+function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1200)}
+function describeAction(a){
+  if(!a)return '—';
+  if(a.type==='place')return '放 '+coord(a.to);
+  if(a.type==='move')return coord(a.from)+'→'+coord(a.to);
+  if(a.type==='capture')return '掐 '+coord(a.to);
+  return '跳过';
+}
+const describeAiAction=describeAction;
+const centerWMain=[0,1,2,1,0,1,3,5,3,1,2,5,8,5,2,1,3,5,3,1,0,1,2,1,0];
+const ALLTMain=[...TSQ.map(c=>({score:1,cells:c})),...T3.map(c=>({score:1,cells:c})),...T4.map(c=>({score:1,cells:c})),...TDR.map(c=>({score:2,cells:c})),...TLI.map(c=>({score:2,cells:c}))];
+function patternPotentialMain(board,p){
+  let sc=0;
+  for(const t of ALLTMain){
+    let me=0,opp=0;
+    for(const i of t.cells){if(board[i]?.p===p)me++;else if(board[i])opp++;}
+    if(opp===0){const n=t.cells.length;if(me===n)sc+=18*t.score;else if(me===n-1)sc+=11*t.score;else if(me===n-2)sc+=3.5*t.score;}
+  }
+  return sc;
+}
+function staticEvalBlack(s){
+  if(s.drawReason)return 0;
+  if(s.winner)return s.winner===1?9900:-9900;
+  const mat=(counts(s.board,1)-counts(s.board,2))*220;
+  const mob=(legalMoves(s.board,1).length-legalMoves(s.board,2).length)*8;
+  const prot=(protectedSet(s.board,1).size-protectedSet(s.board,2).size)*15;
+  const pat=(rawPatterns(s.board,1).reduce((z,q)=>z+q.score,0)-rawPatterns(s.board,2).reduce((z,q)=>z+q.score,0))*22;
+  const pot=patternPotentialMain(s.board,1)-patternPotentialMain(s.board,2);
+  let cent=0;for(let i=0;i<25;i++)if(s.board[i])cent+=(s.board[i].p===1?1:-1)*centerWMain[i]*2;
+  return mat+mob+prot+pat+pot+cent;
+}
+function scoreText(v){
+  if(v>=98)return '黑方胜势';if(v<=-98)return '白方胜势';
+  const n=Math.abs(v)<0.05?0:v;
+  if(n>0.15)return (n>=0?'+':'')+n.toFixed(1)+' 黑优';
+  if(n<-0.15)return n.toFixed(1)+' 白优';
+  return '0.0 均势';
+}
+function gradeFromLoss(loss){
+  if(loss==null)return '分析中';
+  if(loss<=0.12)return '最佳';
+  if(loss<=0.5)return '好棋';
+  if(loss<=1.4)return '可下';
+  if(loss<=3.0)return '失误';
+  return '严重失误';
+}
+function actionEq(a,b){return !!a&&!!b&&a.type===b.type&&(a.to??null)===(b.to??null)&&(a.from??null)===(b.from??null)}
+function humanCanAct(){return !thinking && !state.winner && !state.drawReason && state.turn===human}
+function onPoint(i){
+  if(replayMode||!humanCanAct())return;
+  const acts=legalActions(state);
+  if(state.phase==='place'){
+    if(state.board[i])return; commit({type:'place',to:i},true); return;
+  }
+  if(state.phase==='opening'||state.phase==='capture'){
+    const a=acts.find(x=>x.type==='capture'&&x.to===i); if(a)commit(a,true); return;
+  }
+  if(state.phase==='move'){
+    if(selected==null){
+      if(state.board[i]?.p===human){selected=i;render()} return;
+    }
+    if(i===selected){selected=null;render();return}
+    if(state.board[i]?.p===human){selected=i;render();return}
+    const a=acts.find(x=>x.from===selected&&x.to===i);
+    if(a){selected=null;commit(a,true)} else toast('只能横/竖走到相邻空点');
+  }
+}
+function commit(a,fromHuman,meta={}){
+  const before=cloneState(state), actor=before.turn;
+  saveHistory();
+  if(fromHuman){
+    lastAiTurn=[];
+  }else{
+    lastAiTurn.push({...a});
+  }
+  state=applyAction(state,a);
+  updateDrawRules(before,a);
+  const rec={
+    id:++recordSeq,actor,action:{...a},event:state.lastEvent,before:JSON.stringify(before),after:snap(),
+    evalBlack:staticEvalBlack(state)/100,loss:fromHuman?null:0,grade:fromHuman?'分析中':'最佳',bestAction:fromHuman?null:{...a},depth:meta.depth||0
+  };
+  if(meta.score!=null&&Number.isFinite(meta.score))rec.evalBlack=(actor===1?meta.score:-meta.score)/100;
+  moveRecords.push(rec);
+  selected=null;render();
+  if(fromHuman)requestMoveAnalysis(rec,before,a,actor);
+  if(!state.winner&&!state.drawReason)setTimeout(maybeAI,60);
+}
+function maybeAI(){
+  if(state.winner||state.drawReason||thinking||state.turn!==ai||replayMode)return;
+  const acts=legalActions(state);
+  if(!acts.length)return;
+  if(acts.length===1){commit(acts[0],false);return}
+  thinking=true;render();
+  const level=+document.getElementById('levelSel').value;
+  const ms=[0,220,650,1800,4500][level];
+  ensureWorker();
+  worker.postMessage({mode:'play',state,ai,ms,level});
+}
+function ensureWorker(){
+  if(worker)return;
+  const code='('+aiWorkerMain.toString()+')()';
+  worker=new Worker(URL.createObjectURL(new Blob([code],{type:'text/javascript'})));
+  worker.onmessage=e=>{
+    if(e.data.mode&&e.data.mode!=='play')return;
+    thinking=false;
+    const {action,nodes,score,depth}=e.data;lastNodes=nodes||0;
+    if(action)commit(action,false,{score,depth});else render();
+  };
+  worker.onerror=()=>{thinking=false;toast('AI计算出错，请重新开局');render()}
+}
+function ensureAnalysisWorker(){
+  if(analysisWorker)return;
+  const code='('+aiWorkerMain.toString()+')()';
+  analysisWorker=new Worker(URL.createObjectURL(new Blob([code],{type:'text/javascript'})));
+  analysisWorker.onmessage=e=>{
+    if(e.data.mode!=='analyse')return;
+    const rec=moveRecords.find(x=>x.id===e.data.id);if(!rec)return;
+    const {bestAction,bestVal,chosenVal,depth}=e.data;
+    if(Number.isFinite(chosenVal))rec.evalBlack=(rec.actor===1?chosenVal:-chosenVal)/100;
+    if(Number.isFinite(bestVal)&&Number.isFinite(chosenVal))rec.loss=Math.max(0,(bestVal-chosenVal)/100);
+    rec.grade=gradeFromLoss(rec.loss);rec.bestAction=bestAction||null;rec.depth=depth||0;
+    renderMoveLog();renderEvalChart();renderScoreNow();if(replayMode)renderReplayBar();
+  };
+  analysisWorker.onerror=()=>{};
+}
+function requestMoveAnalysis(rec,before,a,actor){
+  ensureAnalysisWorker();
+  const level=Math.min(3,+document.getElementById('levelSel').value);
+  const ms=[0,180,380,750,900][level];
+  analysisWorker.postMessage({mode:'analyse',id:rec.id,state:before,ai:actor,chosen:a,ms,level});
+}
+function undo(){
+  if(thinking||replayMode)return;
+  if(!undoStack.length){toast('没有可悔的棋');return}
+  let restored=null,hist=null;
+  while(undoStack.length){
+    hist=undoStack.pop();
+    const ss=JSON.parse(hist.state);restored=ss;
+    if(ss.turn===human && !ss.winner && !ss.drawReason) break;
+  }
+  if(restored){
+    state=restored;moveRecords=moveRecords.slice(0,hist.recordLen);selected=null;lastAiTurn=[];endModalShown=false;
+    hideEndModal();render();
+  }
+}
+function restart(){
+  human=+document.getElementById('sideSel').value;ai=3-human;state=newState();undoStack=[];selected=null;thinking=false;lastNodes=0;lastAiTurn=[];
+  moveRecords=[];recordSeq=0;replayMode=false;replayIndex=-1;endModalShown=false;hideEndModal();
+  render();setTimeout(maybeAI,100);
+}
+function renderMoveLog(){
+  const el=document.getElementById('log');
+  if(!moveRecords.length){el.textContent='新局开始。';return}
+  const lines=moveRecords.slice(-24).reverse().map((r,ix)=>{
+    const n=moveRecords.length-ix;
+    const side=r.actor===1?'黑':'白';
+    const q=r.loss==null?'分析中':`${r.grade}${r.loss>0.12?'（损失'+r.loss.toFixed(1)+'）':''}`;
+    return `#${n} ${side} ${describeAction(r.action)} ｜ ${scoreText(r.evalBlack)} ｜ ${q}`;
+  });
+  el.textContent=lines.join('\n');
+}
+function renderScoreNow(){
+  const rec=moveRecords[moveRecords.length-1];
+  const v=rec?rec.evalBlack:staticEvalBlack(state)/100;
+  document.getElementById('scoreNow').textContent='局面评分：'+scoreText(v)+(rec&&rec.loss!=null?' ｜ 上一步：'+rec.grade+(rec.loss>0.12?'，损失 '+rec.loss.toFixed(1):''):'');
+}
+function renderEvalChart(){
+  const cv=document.getElementById('evalChart'),ctx=cv.getContext('2d');
+  const w=cv.width,h=cv.height;ctx.clearRect(0,0,w,h);
+  ctx.strokeStyle='#c9b99f';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(0,h/2);ctx.lineTo(w,h/2);ctx.stroke();
+  ctx.fillStyle='#776c5e';ctx.font='18px sans-serif';ctx.fillText('黑优',8,20);ctx.fillText('白优',8,h-8);
+  if(!moveRecords.length)return;
+  const vals=moveRecords.map(r=>Math.max(-8,Math.min(8,r.evalBlack||0)));
+  ctx.strokeStyle='#2f4e73';ctx.lineWidth=3;ctx.beginPath();
+  vals.forEach((v,i)=>{const x=vals.length===1?w/2:i*(w-20)/(vals.length-1)+10;const y=h/2-(v/8)*(h*.42);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y)});ctx.stroke();
+}
+function getDisplayState(){
+  if(!replayMode)return state;
+  if(replayIndex<0)return newState();
+  return JSON.parse(moveRecords[replayIndex].after);
+}
+function enterReplay(i=moveRecords.length-1){
+  if(!moveRecords.length){toast('还没有棋局可复盘');return}
+  replayMode=true;replayIndex=Math.max(0,Math.min(i,moveRecords.length-1));hideEndModal();render();
+}
+function exitReplay(){replayMode=false;replayIndex=-1;render()}
+function renderReplayBar(){
+  const bar=document.getElementById('replayBar');
+  if(!replayMode){bar.classList.remove('show');return}
+  bar.classList.add('show');
+  const r=moveRecords[replayIndex];
+  const recText=r?`第 ${replayIndex+1}/${moveRecords.length} 步：${r.actor===1?'黑':'白'} ${describeAction(r.action)} ｜ ${scoreText(r.evalBlack)} ｜ ${r.grade}${r.loss!=null&&r.loss>0.12?'，损失 '+r.loss.toFixed(1):''}${r.bestAction&&!actionEq(r.action,r.bestAction)?' ｜ AI推荐：'+describeAction(r.bestAction):''}`:'初始局面';
+  document.getElementById('replayInfo').textContent=recText;
+  document.getElementById('prevReplay').disabled=replayIndex<=0;
+  document.getElementById('nextReplay').disabled=replayIndex>=moveRecords.length-1;
+}
+function showEndModal(){
+  if((!state.winner&&!state.drawReason)||endModalShown||replayMode)return;
+  endModalShown=true;
+  if(state.drawReason){
+    document.getElementById('endTitle').textContent='和棋';
+    document.getElementById('endSub').textContent=state.drawReason==='threefold'
+      ?'同一个完整走棋局面已经第3次出现。'
+      :'双方合计连续100次正常走棋，没有掐子，也没有形成新的有效棋型奖励。';
+  }else{
+    const side=state.winner===1?'黑方':'白方';
+    document.getElementById('endTitle').textContent=state.winReason==='stuck'?`困弊，${side}胜`:`${side}胜`;
+    document.getElementById('endSub').textContent=state.winReason==='stuck'?'对方轮到走棋时已没有任何合法走法。':'对方棋子已被全部掐完。';
+  }
+  document.getElementById('endOverlay').classList.add('show');
+}
+function hideEndModal(){document.getElementById('endOverlay').classList.remove('show')}
+
+function renderBoard(){
+  const b=document.getElementById('board'),ds=getDisplayState();
+  if(!b.dataset.init){
+    for(let k=0;k<5;k++){
+      const h=document.createElement('div');h.className='grid-h';h.style.top=(8+k*21)+'%';b.appendChild(h);
+      const v=document.createElement('div');v.className='grid-v';v.style.left=(8+k*21)+'%';b.appendChild(v);
+    }
+    for(let r=0;r<5;r++)for(let c=0;c<5;c++){
+      const i=idx(r,c),q=document.createElement('button');q.className='pt';q.dataset.i=i;
+      q.style.left=(8+c*21)+'%';q.style.top=(8+r*21)+'%';q.setAttribute('aria-label',coord(i));
+      q.onclick=()=>onPoint(i);b.appendChild(q);
+      const lab=document.createElement('span');lab.className='coord';lab.textContent=coord(i);
+      lab.style.left=(8+c*21+2.8)+'%';lab.style.top=(8+r*21+1.8)+'%';b.appendChild(lab);
+    }
+    b.dataset.init='1';
+  }
+  const pb=protectedSet(ds.board,1),pw=protectedSet(ds.board,2);
+  const capt=!replayMode&&(ds.phase==='capture'||ds.phase==='opening')?new Set(looseTargets(ds.board,3-ds.turn)) : new Set();
+  const replayAction=replayMode&&moveRecords[replayIndex]?moveRecords[replayIndex].action:null;
+  b.querySelectorAll('.pt').forEach(q=>{
+    const i=+q.dataset.i,x=ds.board[i];q.className='pt';
+    if(x)q.classList.add(x.p===1?'black':'white');
+    if(!replayMode&&i===selected)q.classList.add('selected');
+    if(x&&((x.p===1&&pb.has(i))||(x.p===2&&pw.has(i))))q.classList.add('protected');
+    if(capt.has(i))q.classList.add('capturable');
+    if(!replayMode){
+      for(const a of lastAiTurn){
+        if(a.type==='place'&&a.to===i)q.classList.add('ai-last-to');
+        if(a.type==='move'){if(a.from===i)q.classList.add('ai-last-from');if(a.to===i)q.classList.add('ai-last-to');}
+        if(a.type==='capture'&&a.to===i)q.classList.add('ai-last-capture');
+      }
+    }else if(replayAction){
+      if(replayAction.type==='place'&&replayAction.to===i)q.classList.add('replay-to');
+      if(replayAction.type==='move'){if(replayAction.from===i)q.classList.add('replay-from');if(replayAction.to===i)q.classList.add('replay-to');}
+      if(replayAction.type==='capture'&&replayAction.to===i)q.classList.add('replay-capture');
+    }
+  });
+}
+function render(){
+  renderBoard();
+  let st='',sub='';
+  if(replayMode){
+    const r=moveRecords[replayIndex];st=`复盘 · 第 ${replayIndex+1}/${moveRecords.length} 步`;sub=r?r.event:'初始局面';
+    document.getElementById('status').classList.remove('ai-thinking');
+  }else{
+    const who=state.turn===human?'你':'电脑';
+    if(state.drawReason){
+      st='和棋';
+      sub=state.drawReason==='threefold'?'同一完整局面第3次出现':'连续100次正常走棋无掐子、无新棋型奖励';
+    }else if(state.winner){
+      const side=state.winner===1?'黑方':'白方';st=state.winReason==='stuck'?`困弊，${side}胜`:`${side}胜`;sub=state.winReason==='stuck'?'对方无合法走法':'对方棋子已被全部掐完';
+    }else if(thinking){
+      st='电脑思考中…';sub='正在搜索更好的走法';document.getElementById('status').classList.add('ai-thinking');
+    }else{
+      document.getElementById('status').classList.remove('ai-thinking');
+      if(state.phase==='place'){st=`放子阶段 · ${who}走`;sub=state.bonusLeft?`奖励落子还剩 ${state.bonusLeft} 次`:'点击空点落子';}
+      if(state.phase==='opening'){st=`满盘先掐 · ${who}走`;sub=state.openingStage===0?'后手先掐先手一个散子':'先手再掐后手一个散子';}
+      if(state.phase==='move'){st=`走棋阶段 · ${who}走`;sub=state.turn===human?'先点自己的棋子，再点相邻空点':'电脑准备走棋';}
+      if(state.phase==='capture'){st=`掐子阶段 · ${who}走`;sub=`还可掐 ${state.captureLeft} 子，红圈为可掐散子`;}
+    }
+  }
+  document.getElementById('status').textContent=st;document.getElementById('sub').textContent=sub;
+  document.getElementById('lastAi').textContent=!replayMode&&lastAiTurn.length?'电脑本回合：'+lastAiTurn.map(describeAiAction).join('，'):'';
+  const ds=getDisplayState();document.getElementById('countB').textContent='黑 '+counts(ds.board,1);document.getElementById('countW').textContent='白 '+counts(ds.board,2);
+  document.getElementById('nodes').textContent='AI '+lastNodes+' 节点';
+  document.getElementById('undoBtn').disabled=thinking||!undoStack.length||replayMode;
+  document.getElementById('replayBtn').disabled=!moveRecords.length;
+  renderScoreNow();renderMoveLog();renderEvalChart();renderReplayBar();
+  if((state.winner||state.drawReason)&&!replayMode)setTimeout(showEndModal,0);
+}
+
+document.getElementById('newBtn').onclick=restart;
+document.getElementById('undoBtn').onclick=undo;
+document.getElementById('replayBtn').onclick=()=>enterReplay();
+document.getElementById('prevReplay').onclick=()=>{if(replayIndex>0){replayIndex--;render()}};
+document.getElementById('nextReplay').onclick=()=>{if(replayIndex<moveRecords.length-1){replayIndex++;render()}};
+document.getElementById('exitReplay').onclick=exitReplay;
+document.getElementById('againBtn').onclick=restart;
+document.getElementById('reviewBtn').onclick=()=>enterReplay(moveRecords.length-1);
+document.getElementById('sideSel').onchange=()=>{};
+document.getElementById('rulesBtn').onclick=()=>document.querySelector('details').open=true;
+
+function aiWorkerMain(){
+'use strict';
+const N=5,idx=(r,c)=>r*N+c,rc=i=>[Math.floor(i/N),i%N],inb=(r,c)=>r>=0&&r<N&&c>=0&&c<N;
+const T3=[[idx(0,2),idx(1,1),idx(2,0)],[idx(0,2),idx(1,3),idx(2,4)],[idx(2,0),idx(3,1),idx(4,2)],[idx(2,4),idx(3,3),idx(4,2)]];
+const T4=[[idx(0,1),idx(1,2),idx(2,3),idx(3,4)],[idx(0,3),idx(1,2),idx(2,1),idx(3,0)],[idx(1,0),idx(2,1),idx(3,2),idx(4,3)],[idx(1,4),idx(2,3),idx(3,2),idx(4,1)]],TSQ=[];
+for(let r=0;r<4;r++)for(let c=0;c<4;c++)TSQ.push([idx(r,c),idx(r,c+1),idx(r+1,c+1),idx(r+1,c)]);
+const TDR=[[idx(0,0),idx(1,1),idx(2,2),idx(3,3),idx(4,4)],[idx(0,4),idx(1,3),idx(2,2),idx(3,1),idx(4,0)]];
+const TLI=[];for(let r=1;r<=3;r++)TLI.push([0,1,2,3,4].map(c=>idx(r,c)));for(let c=1;c<=3;c++)TLI.push([0,1,2,3,4].map(r=>idx(r,c)));
+const ALLT=[
+ ...TSQ.map(c=>({type:'一方',score:1,cells:c})),
+ ...T3.map(c=>({type:'三步',score:1,cells:c})),
+ ...T4.map(c=>({type:'四步',score:1,cells:c})),
+ ...TDR.map(c=>({type:'五龙',score:2,cells:c})),
+ ...TLI.map(c=>({type:'一溜',score:2,cells:c}))
+];
+function sameCellsContained(a,b){return a.every(x=>b.includes(x))}
+function rawPatterns(board,p){
+ const mine=a=>a.every(i=>board[i]&&board[i].p===p),out=[],li=TLI.filter(mine);
+ for(const a of TSQ)if(mine(a))out.push({type:'一方',score:1,cells:a});
+ for(const a of TDR)if(mine(a))out.push({type:'五龙',score:2,cells:a});
+ for(const a of li)out.push({type:'一溜',score:2,cells:a});
+ const fours=T4.filter(mine);
+ for(const a of fours)if(!li.some(L=>sameCellsContained(a,L)))out.push({type:'四步',score:1,cells:a});
+ const threes=T3.filter(mine);
+ for(const a of threes)if(!li.some(L=>sameCellsContained(a,L))&&!fours.some(L=>sameCellsContained(a,L)))out.push({type:'三步',score:1,cells:a});
+ return out;
+}
+function sigOf(board,pat){return pat.type+'@'+pat.cells.join('.')+'#'+pat.cells.map(i=>board[i]?.id||0).join('-')}
+function protectedSet(board,p){const s=new Set();rawPatterns(board,p).forEach(q=>q.cells.forEach(i=>s.add(i)));return s}
+function newPatterns(s,p){const cl=new Set(s.claimed[p]);return rawPatterns(s.board,p).filter(q=>!cl.has(sigOf(s.board,q)))}
+function clone(s){return{board:s.board.map(x=>x?{p:x.p,id:x.id}:null),nextId:{1:s.nextId[1],2:s.nextId[2]},claimed:{1:[...s.claimed[1]],2:[...s.claimed[2]]},phase:s.phase,turn:s.turn,bonusLeft:s.bonusLeft,captureLeft:s.captureLeft,openingStage:s.openingStage,winner:s.winner||0,winReason:s.winReason||'',lastEvent:''}}
+function count(board,p){let n=0;for(const x of board)if(x?.p===p)n++;return n}
+function legalMoves(board,p){const out=[];for(let i=0;i<25;i++)if(board[i]?.p===p){const[r,c]=rc(i);for(const[dr,dc]of[[1,0],[-1,0],[0,1],[0,-1]]){const r2=r+dr,c2=c+dc;if(inb(r2,c2)&&!board[idx(r2,c2)])out.push({type:'move',from:i,to:idx(r2,c2)})}}return out}
+function looseTargets(board,target){const prot=protectedSet(board,target),a=[];for(let i=0;i<25;i++)if(board[i]?.p===target&&!prot.has(i))a.push(i);return a}
+function terminal(s){if(s.winner)return;if(count(s.board,1)===0){s.winner=2;s.winReason='captured';s.phase='gameover';return}if(count(s.board,2)===0){s.winner=1;s.winReason='captured';s.phase='gameover';return}if(s.phase==='move'&&legalMoves(s.board,s.turn).length===0){s.winner=3-s.turn;s.winReason='stuck';s.phase='gameover'}}
+function actions(s){
+ if(s.winner)return[];
+ if(s.phase==='place'){const a=[];for(let i=0;i<25;i++)if(!s.board[i])a.push({type:'place',to:i});return a}
+ if(s.phase==='opening'){const t=looseTargets(s.board,3-s.turn);return t.length?t.map(i=>({type:'capture',to:i,opening:true})):[{type:'pass',opening:true}]}
+ if(s.phase==='move')return legalMoves(s.board,s.turn);
+ if(s.phase==='capture'){const t=looseTargets(s.board,3-s.turn);return t.length?t.map(i=>({type:'capture',to:i})):[{type:'pass'}]}
+ return[];
+}
+function apply(s0,a){
+ const s=clone(s0),p=s.turn;
+ if(a.type==='place'){
+   if(s.bonusLeft>0)s.bonusLeft--;
+   s.board[a.to]={p,id:s.nextId[p]++};
+   const np=newPatterns(s,p);let g=0;for(const q of np){s.claimed[p].push(sigOf(s.board,q));g+=q.score}s.bonusLeft+=g;
+   if(s.board.every(Boolean)){s.phase='opening';s.turn=2;s.openingStage=0;s.bonusLeft=0}
+   else if(s.bonusLeft===0)s.turn=3-p;
+ }else if(a.type==='capture'&&s.phase==='opening'){
+   if(a.to!=null)s.board[a.to]=null;
+   if(s.openingStage===0){s.openingStage=1;s.turn=1}else{s.phase='move';s.turn=2;s.openingStage=2;terminal(s)}
+ }else if(a.type==='pass'&&s.phase==='opening'){
+   if(s.openingStage===0){s.openingStage=1;s.turn=1}else{s.phase='move';s.turn=2;s.openingStage=2;terminal(s)}
+ }else if(a.type==='move'){
+   s.board[a.to]=s.board[a.from];s.board[a.from]=null;
+   const np=newPatterns(s,p);let g=0;for(const q of np){s.claimed[p].push(sigOf(s.board,q));g+=q.score}
+   if(g>0&&looseTargets(s.board,3-p).length>0){s.phase='capture';s.captureLeft=g}else{s.phase='move';s.captureLeft=0;s.turn=3-p;terminal(s)}
+ }else if(a.type==='capture'&&s.phase==='capture'){
+   if(a.to!=null)s.board[a.to]=null;s.captureLeft--;terminal(s);
+   if(!s.winner&&(s.captureLeft<=0||looseTargets(s.board,3-p).length===0)){s.captureLeft=0;s.phase='move';s.turn=3-p;terminal(s)}
+ }else if(a.type==='pass'&&s.phase==='capture'){s.captureLeft=0;s.phase='move';s.turn=3-p;terminal(s)}
+ return s;
+}
+const centerW=[0,1,2,1,0,1,3,5,3,1,2,5,8,5,2,1,3,5,3,1,0,1,2,1,0];
+function patternPotential(board,p){
+ let sc=0;
+ for(const t of ALLT){
+   let me=0,opp=0,empty=0;
+   for(const i of t.cells){if(board[i]?.p===p)me++;else if(board[i])opp++;else empty++}
+   if(opp===0){
+     const n=t.cells.length;
+     if(me===n)sc+=18*t.score;
+     else if(me===n-1)sc+=11*t.score;
+     else if(me===n-2)sc+=3.5*t.score;
+   }
+ }
+ return sc;
+}
+function evalState(s,ai){
+ if(s.winner)return s.winner===ai?1e8:-1e8;
+ const op=3-ai;
+ const mat=(count(s.board,ai)-count(s.board,op))*220;
+ const mob=(legalMoves(s.board,ai).length-legalMoves(s.board,op).length)*8;
+ const prot=(protectedSet(s.board,ai).size-protectedSet(s.board,op).size)*15;
+ const pat=(rawPatterns(s.board,ai).reduce((z,q)=>z+q.score,0)-rawPatterns(s.board,op).reduce((z,q)=>z+q.score,0))*22;
+ const pot=patternPotential(s.board,ai)-patternPotential(s.board,op);
+ let cent=0;for(let i=0;i<25;i++)if(s.board[i])cent+=(s.board[i].p===ai?1:-1)*centerW[i]*2;
+ if(s.phase==='capture') return mat+mob+prot+pat+pot+cent+(s.turn===ai?70:-70)*s.captureLeft;
+ return mat+mob+prot+pat+pot+cent;
+}
+function quickOrderScore(s,a,ai){
+ let z=0;
+ if(a.type==='capture'){
+   const target=3-s.turn;
+   const before=rawPatterns(s.board,target).filter(q=>q.cells.includes(a.to)).reduce((x,q)=>x+q.score,0);
+   z+=400+before*80;
+ }else if(a.type==='place'){
+   z+=centerW[a.to]*5;
+   const t=apply(s,a);z+=(t.turn===s.turn?120:0);
+ }else if(a.type==='move'){
+   z+=centerW[a.to]-centerW[a.from];
+   const t=apply(s,a);if(t.phase==='capture'&&t.turn===s.turn)z+=180+t.captureLeft*60;
+ }
+ return s.turn===ai?z:-z;
+}
+let deadline=0,nodes=0,aborted=false,tt;
+function key(s,d){
+ let b='';for(const x of s.board)b+=x?x.p+':'+x.id+',':'0,';
+ let h=2166136261>>>0;
+ const cs=s.claimed[1].join('|')+'~'+s.claimed[2].join('|');
+ for(let i=0;i<cs.length;i++){h^=cs.charCodeAt(i);h=Math.imul(h,16777619)}
+ return s.phase+'|'+s.turn+'|'+s.bonusLeft+'|'+s.captureLeft+'|'+s.openingStage+'|'+d+'|'+(h>>>0)+'|'+b;
+}
+function alphabeta(s,d,a,b,ai){
+ nodes++;if((nodes&511)===0&&Date.now()>deadline){aborted=true;return 0}
+ if(d<=0||s.winner)return evalState(s,ai);
+ const k=key(s,d),old=tt.get(k);if(old!=null)return old;
+ let acts=actions(s);if(!acts.length)return evalState(s,ai);
+ acts.sort((x,y)=>quickOrderScore(s,y,ai)-quickOrderScore(s,x,ai));
+ const max=s.turn===ai;let best=max?-Infinity:Infinity;
+ for(const ac of acts){
+   const ns=apply(s,ac);
+   // 同一方因成型而继续加放/掐子，不消耗搜索深度；轮到对方才算一层。
+   const nd=d-((ns.winner||ns.turn!==s.turn)?1:0);
+   const v=alphabeta(ns,nd,a,b,ai);if(aborted)return 0;
+   if(max){if(v>best)best=v;if(best>a)a=best}else{if(v<best)best=v;if(best<b)b=best}
+   if(b<=a)break;
+ }
+ tt.set(k,best);return best;
+}
+function actionEq(a,b){return !!a&&!!b&&a.type===b.type&&(a.to??null)===(b.to??null)&&(a.from??null)===(b.from??null)}
+function search(root,ai,ms,level,chosen=null){
+ deadline=Date.now()+ms;nodes=0;aborted=false;let best=null,bestVal=-Infinity,chosenVal=null,completedDepth=0;
+ const maxDepth=[0,2,4,6,8][level]||4;
+ let rootActs=actions(root);
+ if(!rootActs.length)return{action:null,nodes:0,score:evalState(root,ai),bestVal:evalState(root,ai),chosenVal:null,depth:0};
+ for(let depth=1;depth<=maxDepth;depth++){
+   tt=new Map();aborted=false;
+   let localBest=best,localVal=-Infinity,localChosen=null;
+   rootActs.sort((x,y)=>quickOrderScore(root,y,ai)-quickOrderScore(root,x,ai));
+   for(const ac of rootActs){
+     const ns=apply(root,ac);
+     const nd=depth-((ns.winner||ns.turn!==root.turn)?1:0);
+     const v=alphabeta(ns,nd,-Infinity,Infinity,ai);
+     if(aborted)break;
+     if(chosen&&actionEq(ac,chosen))localChosen=v;
+     if(v>localVal){localVal=v;localBest=ac}
+   }
+   if(!aborted&&localBest){best=localBest;bestVal=localVal;chosenVal=localChosen;completedDepth=depth}
+   if(Date.now()>deadline||aborted)break;
+ }
+ const fallback=evalState(root,ai);
+ return{action:best||rootActs[0],nodes,score:Number.isFinite(bestVal)?bestVal:fallback,bestVal:Number.isFinite(bestVal)?bestVal:fallback,chosenVal,depth:completedDepth};
+}
+
+onmessage=e=>{const{state,ai,ms,level,mode,id,chosen}=e.data;const r=search(state,ai,ms,level,mode==='analyse'?chosen:null);if(mode==='analyse')postMessage({mode:'analyse',id,bestAction:r.action,bestVal:r.bestVal,chosenVal:r.chosenVal,nodes:r.nodes,depth:r.depth});else postMessage({mode:'play',action:r.action,nodes:r.nodes,score:r.score,depth:r.depth})}
+}
+
+window.addEventListener('resize',()=>renderEvalChart());
+restart();
+})();
+</script>
+</body>
+</html>
