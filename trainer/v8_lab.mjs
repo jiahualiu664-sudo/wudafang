@@ -18,7 +18,7 @@
 
 import fs from 'node:fs';
 
-const VERSION='v8-lab-c-0.2';
+const VERSION='v8-lab-c2-native-bridge-0.3';
 const PHASE={PLACE:0,OPENING:1,MOVE:2,CAPTURE:3,GAMEOVER:4};
 const PHASE_NAME=['place','opening','move','capture','gameover'];
 const N=5;
@@ -931,6 +931,306 @@ function runArena(seed,depth,games){
   };
 }
 
+
+// ---------------- V8-C2：冻结原生 Gen4 桥接 ----------------
+// 这一段不再用“兼容旧搜索”代替正式对手，而是把 deep_train.mjs 中 Gen4/V6.5
+// 的原生对象棋盘、claimed 字符串、评价与 searchRoot 语义冻结进实验文件。
+// 实战棋局仍由 V8 Bitboard 规则核心推进；每到 Gen4 思考时，将同一完整状态无损转换
+// 成原生状态后调用冻结搜索，再把动作映射回 Bitboard。桥接自检负责证明两套状态语义一致。
+
+function nativeSigOf(board,pat){return pat.type+'@'+pat.cells.join('.')+'#'+pat.cells.map(i=>board[i]?.id||0).join('-');}
+function nativeSameCellsContained(a,b){return a.every(x=>b.includes(x));}
+function nativeRawPatterns(board,p){
+  const mine=a=>a.every(i=>board[i]&&board[i].p===p),out=[],li=TLI.filter(mine);
+  for(const a of TSQ)if(mine(a))out.push({type:'一方',score:1,cells:a});
+  for(const a of TDR)if(mine(a))out.push({type:'五龙',score:2,cells:a});
+  for(const a of li)out.push({type:'一溜',score:2,cells:a});
+  const fours=T4.filter(mine);
+  for(const a of fours)if(!li.some(L=>nativeSameCellsContained(a,L)))out.push({type:'四步',score:1,cells:a});
+  const threes=T3.filter(mine);
+  for(const a of threes)if(!li.some(L=>nativeSameCellsContained(a,L))&&!fours.some(L=>nativeSameCellsContained(a,L)))out.push({type:'三步',score:1,cells:a});
+  return out;
+}
+function nativeProtectedSet(board,p){const z=new Set();nativeRawPatterns(board,p).forEach(q=>q.cells.forEach(i=>z.add(i)));return z;}
+function nativeNewPatterns(s,p){const cl=new Set(s.claimed[p]);return nativeRawPatterns(s.board,p).filter(q=>!cl.has(nativeSigOf(s.board,q)));}
+function nativeClone(s){return{
+  board:s.board.map(x=>x?{p:x.p,id:x.id}:null),nextId:{1:s.nextId[1],2:s.nextId[2]},
+  claimed:{1:[...s.claimed[1]],2:[...s.claimed[2]]},phase:s.phase,turn:s.turn,
+  bonusLeft:s.bonusLeft,captureLeft:s.captureLeft,openingStage:s.openingStage,
+  winner:s.winner||0,winReason:s.winReason||''
+};}
+function nativeCount(board,p){let n=0;for(const x of board)if(x?.p===p)n++;return n;}
+function nativeLegalMoves(board,p){
+  const out=[];
+  for(let i=0;i<25;i++)if(board[i]?.p===p){
+    const[r,c]=rc(i);
+    for(const[dr,dc]of DIRS){const r2=r+dr,c2=c+dc;if(inb(r2,c2)&&!board[idx(r2,c2)])out.push({type:'move',from:i,to:idx(r2,c2)});}
+  }
+  return out;
+}
+function nativeLooseTargets(board,target){const prot=nativeProtectedSet(board,target),a=[];for(let i=0;i<25;i++)if(board[i]?.p===target&&!prot.has(i))a.push(i);return a;}
+function nativeTerminal(s){
+  if(s.winner)return;
+  if(nativeCount(s.board,1)===0){s.winner=2;s.winReason='captured';s.phase='gameover';return;}
+  if(nativeCount(s.board,2)===0){s.winner=1;s.winReason='captured';s.phase='gameover';return;}
+  if(s.phase==='move'&&nativeLegalMoves(s.board,s.turn).length===0){s.winner=3-s.turn;s.winReason='stuck';s.phase='gameover';}
+}
+function nativeActions(s){
+  if(s.winner)return[];
+  if(s.phase==='place'){const a=[];for(let i=0;i<25;i++)if(!s.board[i])a.push({type:'place',to:i});return a;}
+  if(s.phase==='opening'){const t=nativeLooseTargets(s.board,3-s.turn);return t.length?t.map(i=>({type:'capture',to:i,opening:true})):[{type:'pass',opening:true}];}
+  if(s.phase==='move')return nativeLegalMoves(s.board,s.turn);
+  if(s.phase==='capture'){const t=nativeLooseTargets(s.board,3-s.turn);return t.length?t.map(i=>({type:'capture',to:i})):[{type:'pass'}];}
+  return[];
+}
+function nativeApply(s0,a){
+  const s=nativeClone(s0),p=s.turn;
+  if(a.type==='place'){
+    if(s.bonusLeft>0)s.bonusLeft--;
+    s.board[a.to]={p,id:s.nextId[p]++};
+    const np=nativeNewPatterns(s,p);let g=0;
+    for(const q of np){s.claimed[p].push(nativeSigOf(s.board,q));g+=q.score;}
+    s.bonusLeft+=g;
+    if(s.board.every(Boolean)){s.phase='opening';s.turn=2;s.openingStage=0;s.bonusLeft=0;}
+    else if(s.bonusLeft===0)s.turn=3-p;
+  }else if(a.type==='capture'&&s.phase==='opening'){
+    if(a.to!=null)s.board[a.to]=null;
+    if(s.openingStage===0){s.openingStage=1;s.turn=1;}
+    else{s.phase='move';s.turn=2;s.openingStage=2;nativeTerminal(s);}
+  }else if(a.type==='pass'&&s.phase==='opening'){
+    if(s.openingStage===0){s.openingStage=1;s.turn=1;}
+    else{s.phase='move';s.turn=2;s.openingStage=2;nativeTerminal(s);}
+  }else if(a.type==='move'){
+    s.board[a.to]=s.board[a.from];s.board[a.from]=null;
+    const np=nativeNewPatterns(s,p);let g=0;
+    for(const q of np){s.claimed[p].push(nativeSigOf(s.board,q));g+=q.score;}
+    if(g>0&&nativeLooseTargets(s.board,3-p).length>0){s.phase='capture';s.captureLeft=g;}
+    else{s.phase='move';s.captureLeft=0;s.turn=3-p;nativeTerminal(s);}
+  }else if(a.type==='capture'&&s.phase==='capture'){
+    if(a.to!=null)s.board[a.to]=null;
+    s.captureLeft--;nativeTerminal(s);
+    if(!s.winner&&(s.captureLeft<=0||nativeLooseTargets(s.board,3-p).length===0)){s.captureLeft=0;s.phase='move';s.turn=3-p;nativeTerminal(s);}
+  }else if(a.type==='pass'&&s.phase==='capture'){
+    s.captureLeft=0;s.phase='move';s.turn=3-p;nativeTerminal(s);
+  }
+  return s;
+}
+function nativeRepetitionKey(s){
+  const board=s.board.map(x=>x?`${x.p}:${x.id}`:'0').join(',');
+  const c1=[...s.claimed[1]].sort().join('|'),c2=[...s.claimed[2]].sort().join('|');
+  return board+`#turn=${s.turn}#phase=${s.phase}#c1=${c1}#c2=${c2}`;
+}
+function nativeStateKey(s){return nativeRepetitionKey(s)+`#bonus=${s.bonusLeft}#cap=${s.captureLeft}#open=${s.openingStage}`;}
+function nativeActionText(a){
+  if(!a)return'';
+  if(a.type==='place')return 'P'+coord(a.to);
+  if(a.type==='move')return 'M'+coord(a.from)+'-'+coord(a.to);
+  if(a.type==='capture')return 'X'+coord(a.to);
+  return 'PASS';
+}
+function decodeClaimSig(sig){
+  const patId=Math.floor(sig/(2**25)),pat=PATTERNS[patId];
+  if(!pat)throw new Error('无法解码 claimed：'+sig);
+  let pack=sig-patId*(2**25),ids=[];
+  for(let k=0;k<pat.cells.length;k++){ids.push(Math.floor(pack/(2**(5*k)))&31);}
+  return pat.type+'@'+pat.cells.join('.')+'#'+ids.join('-');
+}
+function toNativeState(s){
+  const board=Array(25).fill(null);
+  for(let i=0;i<25;i++)if(s.owner[i])board[i]={p:s.owner[i],id:s.pid[i]};
+  return{
+    board,nextId:{1:s.nextId1,2:s.nextId2},
+    claimed:{1:[...s.claimed1].map(decodeClaimSig),2:[...s.claimed2].map(decodeClaimSig)},
+    phase:PHASE_NAME[s.phase],turn:s.turn,bonusLeft:s.bonusLeft,captureLeft:s.captureLeft,
+    openingStage:s.openingStage,winner:s.winner||0,winReason:s.winReason||''
+  };
+}
+function nativeToV8Action(a){
+  if(!a)return null;
+  if(a.type==='place')return{type:'P',to:a.to,code:a.to};
+  if(a.type==='capture')return{type:'X',to:a.to,opening:!!a.opening,code:25+a.to};
+  if(a.type==='move')return{type:'M',from:a.from,to:a.to,code:MOVE_CODE[a.from][a.to]};
+  return{type:'S',code:PASS_CODE};
+}
+function v8ToNativeAction(a){
+  if(a.type==='P')return{type:'place',to:a.to};
+  if(a.type==='X')return{type:'capture',to:a.to,opening:!!a.opening};
+  if(a.type==='M')return{type:'move',from:a.from,to:a.to};
+  return{type:'pass',opening:a.opening};
+}
+function nativePatternPotential(board,p){
+  let sc=0;
+  for(const t of PATTERNS){
+    let me=0,opp=0;for(const i of t.cells){if(board[i]?.p===p)me++;else if(board[i])opp++;}
+    if(opp===0){const n=t.cells.length;if(me===n)sc+=18*t.score;else if(me===n-1)sc+=11*t.score;else if(me===n-2)sc+=3.5*t.score;}
+  }
+  return sc;
+}
+function nativeEvalBlack(s){
+  if(s.winner)return s.winner===1?1e8:-1e8;
+  const material=nativeCount(s.board,1)-nativeCount(s.board,2);
+  const mobility=nativeLegalMoves(s.board,1).length-nativeLegalMoves(s.board,2).length;
+  const protectedDiff=nativeProtectedSet(s.board,1).size-nativeProtectedSet(s.board,2).size;
+  const patternDiff=nativeRawPatterns(s.board,1).reduce((z,q)=>z+q.score,0)-nativeRawPatterns(s.board,2).reduce((z,q)=>z+q.score,0);
+  const potential=nativePatternPotential(s.board,1)-nativePatternPotential(s.board,2);
+  let center=0;for(let i=0;i<25;i++)if(s.board[i])center+=(s.board[i].p===1?1:-1)*CENTER_W[i];
+  return material*BASE_W.material+mobility*BASE_W.mobility+protectedDiff*BASE_W.protected+
+         patternDiff*BASE_W.pattern+potential*BASE_W.potential+center*BASE_W.center;
+}
+function nativeEvalFor(s,ai){const v=nativeEvalBlack(s);return ai===1?v:-v;}
+function nativeQuickOrderScore(s,a,ai){
+  const ns=nativeApply(s,a);let z=nativeEvalFor(ns,ai);
+  if(a.type==='capture')z+=280;
+  if(a.type==='place')z+=CENTER_W[a.to]*4;
+  if(a.type==='move'){z+=(CENTER_W[a.to]-CENTER_W[a.from])*2;if(ns.phase==='capture'&&ns.turn===s.turn)z+=180+ns.captureLeft*50;}
+  return z;
+}
+function nativeBranchCap(s,depth){
+  if(s.phase==='place')return depth>=4?7:9;
+  if(s.phase==='move')return depth>=4?9:12;
+  if(s.phase==='capture'||s.phase==='opening')return 10;
+  return 12;
+}
+function nativeOrderedActions(s,ai,depth){
+  const aa=nativeActions(s);if(aa.length<=1)return aa;
+  const max=s.turn===ai;
+  aa.sort((a,b)=>{const va=nativeQuickOrderScore(s,a,ai),vb=nativeQuickOrderScore(s,b,ai);return max?vb-va:va-vb;});
+  return aa.slice(0,nativeBranchCap(s,depth));
+}
+function nativeHashKey(s,depth,ai,wtag){return `${nativeStateKey(s)}#d=${depth}#ai=${ai}#w=${wtag}`;}
+function nativeAB(s,depth,alpha,beta,ai,ctx){
+  ctx.nodes++;
+  if((ctx.nodes&63)===0&&Date.now()>=ctx.deadline){ctx.aborted=true;return nativeEvalFor(s,ai);}
+  if(ctx.nodes>=ctx.maxNodes){ctx.aborted=true;return nativeEvalFor(s,ai);}
+  if(s.winner||depth<=0)return nativeEvalFor(s,ai);
+  const k=nativeHashKey(s,depth,ai,ctx.wtag),old=ctx.tt.get(k);
+  if(old){
+    if(old.flag==='EXACT')return old.v;
+    if(old.flag==='LOWER')alpha=Math.max(alpha,old.v);else if(old.flag==='UPPER')beta=Math.min(beta,old.v);
+    if(alpha>=beta)return old.v;
+  }
+  const alpha0=alpha,beta0=beta,aa=nativeOrderedActions(s,ai,depth);
+  if(!aa.length)return nativeEvalFor(s,ai);
+  const maximizing=s.turn===ai;let best=maximizing?-Infinity:Infinity;
+  for(const a of aa){
+    const ns=nativeApply(s,a),nd=depth-((ns.winner||ns.turn!==s.turn)?1:0),v=nativeAB(ns,nd,alpha,beta,ai,ctx);
+    if(maximizing){if(v>best)best=v;if(best>alpha)alpha=best;}else{if(v<best)best=v;if(best<beta)beta=best;}
+    if(ctx.aborted||alpha>=beta)break;
+  }
+  if(!ctx.aborted){let flag='EXACT';if(best<=alpha0)flag='UPPER';else if(best>=beta0)flag='LOWER';if(ctx.tt.size<ctx.maxTT)ctx.tt.set(k,{v:best,flag});}
+  return best;
+}
+function nativeBudget(depth){
+  return{
+    maxMs:depth<=2?70:depth===3?150:900,
+    maxNodes:depth<=2?12000:depth===3?30000:180000,
+    maxTT:depth<=2?4000:depth===3?8000:36000
+  };
+}
+function nativeSearchRoot(s,targetDepth,ai,wtag='gen4-frozen'){
+  const first=nativeOrderedActions(s,ai,1);
+  if(!first.length)return{action:null,ranked:[],nodes:0,score:nativeEvalFor(s,ai),depth:0,budgetCut:false};
+  const b=nativeBudget(targetDepth),deadline=Date.now()+b.maxMs;
+  let completed=null,totalNodes=0,budgetCut=false;
+  for(let depth=1;depth<=targetDepth;depth++){
+    const aa=nativeOrderedActions(s,ai,depth),ctx={nodes:0,tt:new Map(),wtag,deadline,maxNodes:b.maxNodes,maxTT:b.maxTT,aborted:false},ranked=[];
+    for(const a of aa){
+      const ns=nativeApply(s,a),nd=depth-((ns.winner||ns.turn!==s.turn)?1:0),v=nativeAB(ns,nd,-Infinity,Infinity,ai,ctx);
+      ranked.push({a,v});if(ctx.aborted||Date.now()>=deadline)break;
+    }
+    totalNodes+=ctx.nodes;
+    if(!ctx.aborted&&ranked.length===aa.length){ranked.sort((x,y)=>y.v-x.v);completed={action:ranked[0].a,ranked,score:ranked[0].v,depth};}
+    else{budgetCut=true;break;}
+    if(Date.now()>=deadline)break;
+  }
+  if(completed)return{...completed,nodes:totalNodes,budgetCut};
+  const fallback=first.map(a=>({a,v:nativeQuickOrderScore(s,a,ai)})).sort((x,y)=>y.v-x.v);
+  return{action:fallback[0].a,ranked:fallback,nodes:totalNodes,score:fallback[0].v,depth:0,budgetCut:true};
+}
+
+function nativeSemanticKey(s){
+  return JSON.stringify({
+    state:nativeStateKey(s),next1:s.nextId[1],next2:s.nextId[2],winner:s.winner||0,reason:s.winReason||''
+  });
+}
+function runBridgeCheck(seed=20260918){
+  let samples=0,legalChecks=0,applyChecks=0,evalChecks=0;
+  const detail=[];
+  for(let k=0;k<28;k++){
+    const p=randomPlayout((seed+k*2654435761)>>>0,6+((k*11)%55));
+    const s=p.s;if(s.winner)continue;
+    const ns=toNativeState(s),va=actions(s),na=nativeActions(ns);
+    const vtxt=va.map(actionText).sort(),ntxt=na.map(nativeActionText).sort();
+    assert(JSON.stringify(vtxt)===JSON.stringify(ntxt),`桥接合法着不一致 k=${k}`);legalChecks++;
+    const ev1=evalBlack(s),ev2=nativeEvalBlack(ns);
+    assert(Math.abs(ev1-ev2)<1e-7,`桥接评价不一致 k=${k}: ${ev1} / ${ev2}`);evalChecks++;
+    let local=0;
+    for(const a of va.slice(0,Math.min(10,va.length))){
+      const nA=v8ToNativeAction(a),n2=nativeApply(ns,nA),u=makeMove(s,a);
+      const nFromV8=toNativeState(s),same=nativeSemanticKey(n2)===nativeSemanticKey(nFromV8);
+      unmakeMove(s,u);
+      assert(same,`桥接 apply 不一致 k=${k} a=${actionText(a)}`);applyChecks++;local++;
+    }
+    if(detail.length<10)detail.push({k,phase:PHASE_NAME[s.phase],turn:s.turn,legal:va.length,eval:Number(ev1.toFixed(4)),applyChecked:local});
+    samples++;
+  }
+  assert(samples>=16,'桥接自检有效样本不足');
+  return{status:'PASS',samples,legalChecks,applyChecks,evalChecks,detail};
+}
+function playNativeBridgeGame(sc,v8Side,depth){
+  const s=cloneStateFast(sc.state),rep=new Map(sc.rep),b=nativeBudget(depth);
+  let noProgress=sc.noProgress||0,actionsPlayed=0,drawReason='';
+  let v8Nodes=0,nativeNodes=0,v8Ext=0,v8Q=0,v8Cuts=0,nativeCuts=0,v8DepthSum=0,v8Calls=0,nativeDepthSum=0,nativeCalls=0;
+  while(!s.winner&&!drawReason&&actionsPlayed<320){
+    const actor=s.turn;let a=null;
+    if(actor===v8Side){
+      const res=searchV8(s,depth,actor,{rep,noProgress,useQ:true,extensions:1,qDepth:2,nodeLimit:b.maxNodes,maxMs:b.maxMs});
+      a=res.action;v8Nodes+=res.nodes;v8Ext+=res.extensions||0;v8Q+=res.qnodes||0;v8DepthSum+=res.depth||0;v8Calls++;if(res.aborted||res.depth<depth)v8Cuts++;
+    }else{
+      const native=toNativeState(s),res=nativeSearchRoot(native,depth,actor);
+      a=nativeToV8Action(res.action);nativeNodes+=res.nodes;nativeDepthSum+=res.depth||0;nativeCalls++;if(res.budgetCut||res.depth<depth)nativeCuts++;
+      if(a){const legal=actions(s).some(x=>actionCode(x)===actionCode(a));if(!legal)throw new Error('原生Gen4返回非法桥接动作 '+nativeActionText(res.action));}
+    }
+    if(!a){a=actions(s)[0]||null;}if(!a)break;
+    const u=makeMove(s,a),step=pushDraw(null,a,s,u,noProgress,rep);noProgress=step.np;actionsPlayed++;
+    if(step.draw)drawReason=noProgress>=100?'no-progress':'threefold';
+  }
+  if(!s.winner&&!drawReason&&actionsPlayed>=320)drawReason='safety-cap';
+  let result=0;if(s.winner)result=s.winner===v8Side?1:-1;
+  return{
+    result,winner:s.winner||0,drawReason,actions:actionsPlayed,v8Side,
+    nodes:{v8:v8Nodes,native:nativeNodes},extensions:v8Ext,qnodes:v8Q,
+    cuts:{v8:v8Cuts,native:nativeCuts},calls:{v8:v8Calls,native:nativeCalls},
+    avgDepth:{v8:v8Calls?Number((v8DepthSum/v8Calls).toFixed(3)):0,native:nativeCalls?Number((nativeDepthSum/nativeCalls).toFixed(3)):0}
+  };
+}
+function runNativeBridge(seed,depth,games){
+  games=Math.max(4,Math.floor(games/2)*2);const pairs=games/2,b=nativeBudget(depth),scenarios=generateArenaScenarios(seed,pairs);
+  const rows=[];let v8Wins=0,nativeWins=0,draws=0,safety=0,totalV8Nodes=0,totalNativeNodes=0,totalExt=0,totalQ=0,totalV8Cuts=0,totalNativeCuts=0;
+  const v8Black={w:0,l:0,d:0},v8White={w:0,l:0,d:0},t0=Date.now();
+  for(const sc of scenarios){
+    for(const v8Side of [1,2]){
+      const g=playNativeBridgeGame(sc,v8Side,depth);
+      if(g.result>0){v8Wins++;(v8Side===1?v8Black:v8White).w++;}
+      else if(g.result<0){nativeWins++;(v8Side===1?v8Black:v8White).l++;}
+      else{draws++;(v8Side===1?v8Black:v8White).d++;}
+      if(g.drawReason==='safety-cap')safety++;
+      totalV8Nodes+=g.nodes.v8;totalNativeNodes+=g.nodes.native;totalExt+=g.extensions;totalQ+=g.qnodes;totalV8Cuts+=g.cuts.v8;totalNativeCuts+=g.cuts.native;
+      rows.push({scenario:sc.id,plies:sc.plies,phase:sc.phase,hash:sc.hash,...g});
+      console.log(`[v8-lab] bridge ${rows.length}/${games}：V8${v8Side===1?'黑':'白'} ${g.result>0?'胜':g.result<0?'负':'和'}；动作${g.actions}；V8深度${g.avgDepth.v8} / 原生Gen4深度${g.avgDepth.native}`);
+    }
+  }
+  const score=(v8Wins+0.5*draws)/games;
+  return{
+    version:VERSION,mode:'bridge',opponent:'frozen-native-gen4-v6.5-searchRoot',seed,depth,games,pairs,
+    exactBudget:b,v8Wins,nativeWins,draws,v8Score:Number(score.toFixed(4)),v8Black,v8White,safetyCaps:safety,
+    totalNodes:{v8:totalV8Nodes,native:totalNativeNodes},budgetCuts:{v8:totalV8Cuts,native:totalNativeCuts},
+    v8Extensions:totalExt,v8QNodes:totalQ,elapsedMs:Date.now()-t0,
+    scenarios:scenarios.map(x=>({id:x.id,plies:x.plies,phase:x.phase,turn:x.turn,hash:x.hash})),gamesDetail:rows,
+    interpretation:'V8-C2桥接：对手为从正式 deep_train.mjs 冻结的原生 Gen4/V6.5 searchRoot 语义；双方目标深度相同，V8使用与原生Gen4完全相同的单次时间/节点预算。仍是实验，不修改baseline。'
+  };
+}
+
 function parseArgs(){
   const a=process.argv.slice(2),out={mode:'smoke',depth:2,seed:20260914,games:12};
   for(let i=0;i<a.length;i++){
@@ -989,6 +1289,41 @@ try{
     const bench=runBench(cfg.seed,cfg.depth);
     writeJson('bench.json',{version:VERSION,depth:cfg.depth,seed:cfg.seed,bench});
     console.log(JSON.stringify(bench,null,2));
+  }else if(cfg.mode==='bridgecheck'){
+    const t0=Date.now(),bridge=runBridgeCheck(cfg.seed);
+    writeJson('bridgecheck.json',{version:VERSION,baselineGeneration:LOADED_BASE.generation,bridge,elapsedMs:Date.now()-t0});
+    writeSummary([
+      '# 五道方 V8-C2 原生Gen4桥接自检','',
+      `- 状态：**${bridge.status}**`,
+      `- 随机完整状态：${bridge.samples} 个`,
+      `- 合法着集合一致：${bridge.legalChecks}/${bridge.samples}`,
+      `- Gen4评价一致：${bridge.evalChecks}/${bridge.samples}`,
+      `- 单步 apply 语义一致：${bridge.applyChecks} 次`,'',
+      '> 只有桥接自检通过后，才允许运行原生Gen4对V8擂台。不会修改正式基线。'
+    ]);
+    console.log(`[v8-lab] BRIDGECHECK PASS：${bridge.samples}状态；${bridge.applyChecks}次apply一致`);
+  }else if(cfg.mode==='bridge'){
+    const bridgeCheck=runBridgeCheck((cfg.seed^0xA5A5A5A5)>>>0);
+    const arena=runNativeBridge(cfg.seed,cfg.depth,cfg.games);
+    writeJson('bridge.json',{bridgeCheck,arena});
+    writeSummary([
+      '# 五道方 V8-C2 · V8 vs 冻结原生Gen4','',
+      `- 桥接自检：**${bridgeCheck.status}**（${bridgeCheck.samples}状态 / ${bridgeCheck.applyChecks}次apply）`,
+      `- 对手：冻结原生 Gen4/V6.5 searchRoot`,
+      `- 对局：${arena.games}盘（成对换边）`,
+      `- 深度目标：${arena.depth}`,
+      `- 原生Gen4正式预算：${arena.exactBudget.maxMs}ms / ${arena.exactBudget.maxNodes}节点 / TT ${arena.exactBudget.maxTT}`,
+      `- V8：${arena.v8Wins}胜；原生Gen4：${arena.nativeWins}胜；和：${arena.draws}`,
+      `- **V8得分率：${(arena.v8Score*100).toFixed(1)}%**`,
+      `- V8执黑：${arena.v8Black.w}胜/${arena.v8Black.l}负/${arena.v8Black.d}和`,
+      `- V8执白：${arena.v8White.w}胜/${arena.v8White.l}负/${arena.v8White.d}和`,
+      `- 预算未跑满调用：V8 ${arena.budgetCuts.v8} / 原生Gen4 ${arena.budgetCuts.native}`,
+      `- 总节点：V8 ${arena.totalNodes.v8} / 原生Gen4 ${arena.totalNodes.native}`,
+      `- V8战术延伸：${arena.v8Extensions}；静态战术节点：${arena.v8QNodes}`,
+      `- 耗时：${(arena.elapsedMs/1000).toFixed(1)}秒`,'',
+      '> 仍不是Gen5晋级。先验证原生桥接和公平预算；通过后再进入深度4、关键池+随机池正式终审。'
+    ]);
+    console.log(`[v8-lab] BRIDGE DONE：V8 ${arena.v8Wins}胜 / 原生Gen4 ${arena.nativeWins}胜 / ${arena.draws}和；得分率 ${(arena.v8Score*100).toFixed(1)}%`);
   }else if(cfg.mode==='arena'){
     const arena=runArena(cfg.seed,cfg.depth,cfg.games);
     writeJson('arena.json',arena);
