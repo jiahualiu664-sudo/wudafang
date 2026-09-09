@@ -2,19 +2,17 @@
 'use strict';
 
 /*
-  五道方 V2.3 深度训练器 V6.4（Gen5 修复搜索 · 相位抑制战术 · 共享双池筛选 · 深度4独立终审）
+  五道方 V2.3 深度训练器 V6.5（多Seed稳定选拔 · 多池交叉验证 · 保守战术融合 · 深度4独立终审）
 
-  V6.4 针对 V6.3 终审结果做定向修复：
-  - V6.3 的“威胁成型35%”在深度4关键对比池只有47.5%，随机池51.7%，总分49.6%。
-  - 说明新棋理并非完全无效，但在摆子/过渡阶段过早改变许多接近五五开的选择。
-  - V6.4 对 threat/fork/constraint 做相位抑制：摆子阶段55%，满盘先掐75%，掐子90%，正常走棋100%。
-    Gen4 的三个新权重为0，因此正式 Gen4 棋力不会被偷偷改变。
-  - 候选围绕历史上最有希望的“战术均衡35%”与“威胁成型35%”做局部插值与解耦搜索，
-    不重新大幅拟合，避免参数乱跳。
-  - 第一阶段用 V6.3 失败关键局面 + 新分歧局面做深度4老师考试；
-    第二、三阶段使用所有候选共享的50/50关键池+随机池做深度4实战筛选，避免候选各考各的题。
-  - 最后只让筛出的单一冠军参加全新 Seed 的120盘深度4独立终审。
-  - 晋级标准不降低：总得分率>=55%，且关键池、随机池都>=50%，才自动写入 Gen5。
+  V6.5 针对 V6.3 / V6.4 连续出现“预筛看起来强、独立终审掉回50%左右”的过拟合问题：
+  - 不再用单一共享池决定冠军，而是用多个互不重叠 Seed 的关键池 + 随机池交叉验证。
+  - 候选排序优先看“最差一次表现”和“关键/随机两类池的较弱一边”，避免只靠某一套题冲高分。
+  - 保留老师深搜考试，但额外强制保留“只调旧参数”和“极保守新棋理”方向，防止老师考试一家独大。
+  - 新棋理进一步保守：摆子35%，满盘先掐60%，掐子85%，正常走棋100%。Gen4 新三权重为0，因此不会偷偷改变正式Gen4。
+  - 候选范围从接近Gen4的超保守方案，到历史战术/威胁方向的中等幅度方案，避免再次只围绕同一个90%冠军打转。
+  - Stage2：3个独立Seed，每个12盘共享双池；Stage3：2个全新Seed，每个20盘共享双池。
+  - 最后只让跨Seed最稳定的单一冠军参加全新Seed的120盘深度4独立终审。
+  - 晋级标准不降低：总得分率>=55%，且关键池、随机池都>=50%，才自动写入Gen5。
 */
 
 import fs from 'node:fs';
@@ -331,9 +329,9 @@ const BASE_GENERATION=loadBaselineGeneration();
 function evalBlack(s,w=BASE_WEIGHTS){
   if(s.winner)return s.winner===1?1e8:-1e8;
   const f=featuresBlack(s);
-  // V6.4：V6.3 证明战术新特征在早期摆子阶段过于积极。
+  // V6.5：根据 V6.3/V6.4 终审结果，进一步压低早期战术新特征影响。
   // Gen4 的 threat/fork/constraint 都为0，所以这个语义变化不会改变正式 Gen4。
-  const tacticalScale=s.phase==='place'?0.55:s.phase==='opening'?0.75:s.phase==='capture'?0.90:1.0;
+  const tacticalScale=s.phase==='place'?0.35:s.phase==='opening'?0.60:s.phase==='capture'?0.85:1.0;
   return f.material*w.material+
          f.mobility*w.mobility+
          f.protected*w.protected+
@@ -1405,7 +1403,7 @@ function buildPromotionTournament(candidate,base,depth,games,seed,openingMap){
     candidateWins,baselineWins,draws,
     candidateScore:Number(score.toFixed(4)),accepted,
     totalNodes:contrast.totalNodes+control.totalNodes,
-    mode:'v6.3-fixed-candidate-depth4-final-50-50',
+    mode:'v6.5-independent-depth4-final-50-50',
     acceptancePolicy:{overallMin:0.55,contrastMin:0.50,controlMin:0.50},
     contrastTargetShare:0.50,
     contrastProbeDepth:contrastPack.probeDepth,
@@ -1430,31 +1428,6 @@ function buildPromotionTournament(candidate,base,depth,games,seed,openingMap){
 }
 
 
-const started=Date.now();
-const openingMap=new Map();
-const priorOpeningPositions=loadPriorOpeningBook(openingMap);
-
-function approx(a,b,tol=0.0002){return Math.abs(Number(a)-Number(b))<=tol;}
-function assertExpectedBaseline(){
-  if(BASE_GENERATION!==4){
-    throw new Error(`V6.4 冲 Gen5 要求正式基线仍为 Gen4；当前检测到 Gen${BASE_GENERATION}，为避免误测已停止。`);
-  }
-  const expected={material:80.8132,mobility:30,protected:4.2116,pattern:18.7737,potential:5,center:8};
-  for(const [k,v] of Object.entries(expected)){
-    if(!approx(BASE_WEIGHTS[k],v,0.001)){
-      throw new Error(`V6.4 检测到 Gen4 基线参数 ${k}=${BASE_WEIGHTS[k]} 与预期 ${v} 不一致，已停止。`);
-    }
-  }
-}
-assertExpectedBaseline();
-
-if(cfg.games>=10 && cfg.depth!==4){
-  throw new Error('V6.4 是深度4冲 Gen5 版：正式运行请把 Depth 选择为 4。');
-}
-const realRun=cfg.games>=10;
-const examDepth=realRun?4:Math.max(2,cfg.depth);
-const baseSeed=cfg.seed>>>0;
-
 const HIST_TACTICAL35={
   material:80.513,mobility:30,protected:4.8525,pattern:18.3877,potential:5,center:8,
   threat:3.28,fork:2.86,constraint:0.908
@@ -1463,257 +1436,145 @@ const HIST_THREAT35={
   material:80.548,mobility:30,protected:4.8401,pattern:18.5593,potential:5,center:7.8516,
   threat:3.455,fork:2.16,constraint:0.733
 };
+const V64_CHAMPION={
+  material:80.543,mobility:30,protected:4.7884,pattern:18.4263,potential:5,center:8,
+  threat:2.952,fork:2.574,constraint:0.8172
+};
 function interpWeights(target,scale,oldScale=scale,newScale=scale){
   const out={};
   for(const k of OLD_WEIGHT_KEYS)out[k]=Number((BASE_WEIGHTS[k]+(target[k]-BASE_WEIGHTS[k])*oldScale).toFixed(4));
   for(const k of NEW_WEIGHT_KEYS)out[k]=Number((BASE_WEIGHTS[k]+(target[k]-BASE_WEIGHTS[k])*newScale).toFixed(4));
   return out;
 }
-function mixTargets(a,b,t=0.5){
-  const out={};
-  for(const k of FEATURE_NAMES)out[k]=Number((Number(a[k])*(1-t)+Number(b[k])*t).toFixed(4));
-  return out;
-}
-function makeCandidate(name,profile,weights,note=''){
-  return{name,profile,weights,source:'V6.4-repair-search',note};
-}
-function buildV64Candidates(){
-  const out=[];
-  // 围绕历史 D4 表现更稳的“战术均衡35%”做密集局部搜索。
-  for(const [label,s] of [['60',0.60],['75',0.75],['90',0.90],['100',1.00],['110',1.10]]){
-    out.push(makeCandidate(`战术修复${label}%`,'tactical-repair',interpWeights(HIST_TACTICAL35,s),`历史战术35%的${label}%局部幅度`));
-  }
-  // 威胁方向保留少量较稳档，V6.3 原候选仍作为参照，但已使用相位抑制语义。
-  for(const [label,s] of [['75',0.75],['90',0.90],['100',1.00]]){
-    out.push(makeCandidate(`威胁修复${label}%`,'threat-repair',interpWeights(HIST_THREAT35,s),`历史威胁35%的${label}%局部幅度`));
-  }
-  // 把旧六参数与新三参数拆开，判断问题究竟来自旧权重偏移还是战术新特征过强。
-  out.push(makeCandidate('战术旧75新100','decoupled',interpWeights(HIST_TACTICAL35,1,0.75,1.00),'旧六参数收敛一些，新棋理保持历史战术35强度'));
-  out.push(makeCandidate('战术旧100新75','decoupled',interpWeights(HIST_TACTICAL35,1,1.00,0.75),'旧六参数保持历史战术35，新棋理再收敛'));
-  const mix=mixTargets(HIST_TACTICAL35,HIST_THREAT35,0.5);
-  out.push(makeCandidate('战术威胁混合85','hybrid',interpWeights(mix,0.85),'两个历史方向取中间再收敛'));
-  out.push(makeCandidate('新棋理保守','new-only',{
-    ...BASE_WEIGHTS,threat:2.35,fork:1.85,constraint:0.65
-  },'完全保留Gen4旧六参数，只小幅加入新棋理'));
-  return out;
-}
-const candidateSet=buildV64Candidates();
-
-// V6.3 正式终审的16个高优先关键局面，只用于修复/筛选，不参与最终晋级考试。
-const V63_REPAIR_LINES=[["PC3","PB4","PD4","PB2","PC5","PE3","PA3","PC4","PC1","PD5","PD2","PC2","PA1","PB3","PA4","PD3","PE1","PB5","PB1","PA2","PE2","PE4","PD1","PE5","PA5","XC3","XB4","MD3-C3","XA3"],["PC3","PB2","PC1","PB4","PC5","PD4","PC2","PC4","PB3","PD2","PD3","PE3","PA4","PB1","PA2","PA3","PD1","PE2","PE5","PD5","PA1","PE4","PA5"],["PB4","PB3","PB2","PC2","PA3","PC5","PC1","PD3","PD1","PC3","PA4","PC4","PE3","PD2","PE1","PE4","PD5","PA2","PA5","PA1","PE5","PD4","PB1","PB5","PE2","XB4","XC4","MD4-C4","MD3-D4","MB3-B4","XA5","MB2-B3"],["PB4","PC3","PA3","PC5","PD2","PD4","PE3","PC1","PC4","PB2"],["PC3","PB3","PD2","PC5","PE3","PC1","PB4","PB2","PA3","PD3","PD4"],["PC3","PB3","PB2","PC1","PD4","PD2","PE3","PC5","PB4"],["PC3","PB3","PB4","PC5","PD2","PD4","PE3","PC1","PB2"],["PC3","PB3","PD2","PC4","PB4","PC2","PE3","PC1"],["PC3","PB3","PD2","PE3","PB4","PC2"],["PC3","PB3","PD2","PC4","PB4","PC2"],["PB2","PC3","PB4","PD2","PA3","PC5","PC1","PD4","PA2","PE3","PB3"],["PC3","PB4","PA3","PC1","PE3","PD3","PD2","PC5","PB2","PB3","PD4","PA1","PC4","PE2","PA5","PE4","PC2"],["PC3","PB2","PA3","PB4","PD2","PD3","PC1","PE3","PC5","PD1","PE4","PC2","PD4","PE5"],["PC3","PB3","PD2","PC4","PC1","PE3","PA3","PB2","PB4","PC5","PD4","PA5","PC2","PD1","PD3","PA2","PE4","PE1","PA1","PE5"],["PC3","PB2","PB4","PD2","PA3","PC5","PD3","PB3","PC1","PC4","PD5","PD4","PE3","PC2"],["PC3","PB4","PB2","PC5","PA3","PC1","PC4","PD2","PE3","PD3","PD5","PB3","PB5","PA2","PC2","PD4","PD1","PE1","PB1","PA1"]];
-function repairScenarios(){
+function makeCandidate(name,profile,weights,note=''){return{name,profile,weights,source:'V6.5-multiseed-stability',note};}
+function buildV65Candidates(){
   const out=[],seen=new Set();
-  for(const line of V63_REPAIR_LINES){
-    const state=replaySequence(line);
-    if(!state||state.winner)continue;
+  const add=c=>{const k=JSON.stringify(c.weights);if(!seen.has(k)){seen.add(k);out.push(c);}};
+  for(const [label,s] of [['35',0.35],['45',0.45],['55',0.55],['65',0.65],['75',0.75]])
+    add(makeCandidate(`战术稳健${label}%`,'tactical-stable',interpWeights(HIST_TACTICAL35,s),`历史战术35方向的${label}%幅度`));
+  for(const [label,s] of [['45',0.45],['60',0.60],['75',0.75]])
+    add(makeCandidate(`V64冠军回缩${label}%`,'v64-shrink',interpWeights(V64_CHAMPION,s),`V6.4冠军向Gen4回缩到${label}%`));
+  for(const [label,s] of [['40',0.40],['55',0.55],['70',0.70]])
+    add(makeCandidate(`威胁稳健${label}%`,'threat-stable',interpWeights(HIST_THREAT35,s),`历史威胁35方向的${label}%幅度`));
+  for(const [name,t,f,c] of [
+    ['新棋理极轻',0.80,0.70,0.25],['新棋理轻量',1.20,1.00,0.35],['新棋理中轻',1.60,1.30,0.45],['新棋理保守',2.00,1.60,0.55]
+  ]) add(makeCandidate(name,'new-only',{...BASE_WEIGHTS,threat:t,fork:f,constraint:c},'旧六参数完全不动，只加入保守新棋理'));
+  for(const [label,s] of [['50',0.50],['80',0.80]])
+    add(makeCandidate(`旧参数微调${label}%`,'old-only',interpWeights(HIST_TACTICAL35,1,s,0),`只沿战术方向微调旧六参数${label}%，新三权重保持0`));
+  return out;
+}
+const candidateSet=buildV65Candidates();
+
+const V63_REPAIR_LINES=[["PC3","PB4","PD4","PB2","PC5","PE3","PA3","PC4","PC1","PD5","PD2","PC2","PA1","PB3","PA4","PD3","PE1","PB5","PB1","PA2","PE2","PE4","PD1","PE5","PA5","XC3","XB4","MD3-C3","XA3"],["PC3","PB2","PC1","PB4","PC5","PD4","PC2","PC4","PB3","PD2","PD3","PE3","PA4","PB1","PA2","PA3","PD1","PE2","PE5","PD5","PA1","PE4","PA5"],["PB4","PB3","PB2","PC2","PA3","PC5","PC1","PD3","PD1","PC3","PA4","PC4","PE3","PD2","PE1","PE4","PD5","PA2","PA5","PA1","PE5","PD4","PB1","PB5","PE2","XB4","XC4","MD4-C4","MD3-D4","MB3-B4","XA5","MB2-B3"],["PB4","PC3","PA3","PC5","PD2","PD4","PE3","PC1","PC4","PB2"],["PC3","PB3","PD2","PC5","PE3","PC1","PB4","PB2","PA3","PD3","PD4"],["PC3","PB3","PB2","PC1","PD4","PD2","PE3","PC5","PB4"],["PC3","PB3","PB4","PC5","PD2","PD4","PE3","PC1","PB2"],["PC3","PB3","PD2","PC4","PB4","PC2","PE3","PC1"],["PC3","PB3","PD2","PE3","PB4","PC2"],["PC3","PB3","PD2","PC4","PB4","PC2"],["PB2","PC3","PB4","PD2","PA3","PC5","PC1","PD4","PA2","PE3","PB3"],["PC3","PB4","PA3","PC1","PE3","PD3","PD2","PC5","PB2","PB3","PD4","PA1","PC4","PE2","PA5","PE4","PC2"],["PC3","PB2","PA3","PB4","PD2","PD3","PC1","PE3","PC5","PD1","PE4","PC2","PD4","PE5"],["PC3","PB3","PD2","PC4","PC1","PE3","PA3","PB2","PB4","PC5","PD4","PA5","PC2","PD1","PD3","PA2","PE4","PE1","PA1","PE5"],["PC3","PB2","PB4","PD2","PA3","PC5","PD3","PB3","PC1","PC4","PD5","PD4","PE3","PC2"],["PC3","PB4","PB2","PC5","PA3","PC1","PC4","PD2","PE3","PD3","PD5","PB3","PB5","PA2","PC2","PD4","PD1","PE1","PB1","PA1"]];
+const V64_REPAIR_LINES=[["PC3","PD2","PB2","PB3","PD4","PC4","PE3","PC5","PC1","PA2","PA3","PB4","PE5","PE1","PA5","PD3","PD5","PE4","PC2","PD1","PA1","PA4","PE2","PB5","PB1","XB4","XD2","MB3-B4","XC3","XE3","ME2-E3","MD1-D2"],["PB4","PC3","PA3","PC5","PD2","PD4","PE3","PC1","PC4","PB2"],["PC3","PB3","PD2","PC5","PE3","PC1","PB4","PB2","PA3","PD3","PD4"],["PC3","PB3","PB2","PC1","PD4","PD2","PE3","PC5","PB4"],["PC3","PB3","PB4","PC5","PD2","PD4","PE3","PC1","PB2"],["PC3","PB2","PD2","PC1","PA3","PD4","PE3","PB4"],["PC3","PB3","PD2","PE3","PB4","PC2"],["PC3","PB3","PD2","PC4","PB4","PC2","PE3","PC1"],["PC3","PB3","PD2","PC4","PB4","PC2"],["PC3","PD4","PB4","PD2","PE3","PA3","PB2","PC4","PC5","PC2","PD1","PE5","PA5","PB1"],["PD2","PC3","PB4","PB2","PD4","PC5","PE3","PC1","PA3","PD3","PC2"],["PC3","PB2","PD4","PA3","PC1","PE3","PD2","PC4","PC5","PB4","PA2"],["PC3","PB3","PD2","PC4","PC1","PE3","PA3","PB2","PB4","PC5","PD4","PA5","PC2","PD1","PD3","PA2","PE4","PE1","PA1","PE5"],["PC3","PB3","PD2","PC4","PD4","PE3"],["PC3","PB3","PB2","PC1","PD4","PD2","PE3","PC5","PB4","PC4","PE5"],["PC3","PB3","PB4","PC5","PD2","PD4","PE3","PC1","PB2","PC2","PE1"]];
+function linesToScenarios(lines,source){
+  const out=[],seen=new Set();
+  for(const line of lines){
+    const state=replaySequence(line);if(!state||state.winner)continue;
     const sk=stateKey(state);if(seen.has(sk))continue;seen.add(sk);
-    out.push({p:out.length,plies:line.length,state,line,source:'v6.3-failure'});
+    out.push({p:out.length,plies:line.length,state,line,source});
   }
   return out;
 }
 function uniqueScenarios(rows,limit=999){
   const out=[],seen=new Set();
-  for(const x of rows){
-    if(out.length>=limit)break;
-    const sk=stateKey(x.state);if(seen.has(sk))continue;seen.add(sk);
-    out.push({...x,p:out.length});
-  }
+  for(const x of rows){if(out.length>=limit)break;const sk=stateKey(x.state);if(seen.has(sk))continue;seen.add(sk);out.push({...x,p:out.length});}
   return out;
 }
-function scoreDualTour(t){
-  const floor=Math.min(t.contrast.candidateScore,t.control.candidateScore);
-  return{
-    floor:Number(floor.toFixed(4)),
-    selection:Number((0.58*t.candidateScore+0.42*floor).toFixed(4))
-  };
-}
 function buildSharedDualPool(candidates,base,depth,games,seed,openingMap){
-  const targetGames=Math.max(4,games-(games%2));
-  const totalScenarios=targetGames/2;
-  const wantedContrast=Math.max(1,Math.round(totalScenarios*0.50));
+  const targetGames=Math.max(4,games-(games%2)),totalScenarios=targetGames/2,wantedContrast=Math.max(1,Math.round(totalScenarios*0.50));
   const pool=[],seen=new Set();
   for(let i=0;i<candidates.length;i++){
-    const pack=buildBaselineCandidateContrastScenarios(
-      candidates[i].weights,base,depth,wantedContrast*2,(seed+i*0x9E3779B9)>>>0,openingMap
-    );
-    for(const sc of pack.scenarios){
-      const sk=stateKey(sc.state);
-      if(seen.has(sk))continue;seen.add(sk);
-      pool.push({...sc,discoveredBy:candidates[i].name});
-    }
+    const pack=buildBaselineCandidateContrastScenarios(candidates[i].weights,base,depth,wantedContrast*2,(seed+i*0x9E3779B9)>>>0,openingMap);
+    for(const sc of pack.scenarios){const sk=stateKey(sc.state);if(seen.has(sk))continue;seen.add(sk);pool.push({...sc,discoveredBy:candidates[i].name});}
   }
   const typeWeight={hard:4,soft:3,'eval-gap':2,weak:1};
   pool.sort((a,b)=>(typeWeight[b.type]||0)-(typeWeight[a.type]||0)||b.rank-a.rank||(b.visits||0)-(a.visits||0));
   let contrast=pool.slice(0,wantedContrast);
-  if(contrast.length<wantedContrast){
-    const fill=buildTournamentScenarios(base,depth,(wantedContrast-contrast.length)*2,(seed+0x243F6A88)>>>0);
-    contrast=uniqueScenarios([...contrast,...fill],wantedContrast);
-  }
+  if(contrast.length<wantedContrast){const fill=buildTournamentScenarios(base,depth,(wantedContrast-contrast.length)*2,(seed+0x243F6A88)>>>0);contrast=uniqueScenarios([...contrast,...fill],wantedContrast);}
   contrast=contrast.slice(0,wantedContrast).map((x,i)=>({...x,p:i}));
   const controlCount=Math.max(1,totalScenarios-contrast.length);
-  const control=buildTournamentScenarios(base,depth,controlCount*2,(seed+0xB7E15162)>>>0)
-    .slice(0,controlCount).map((x,i)=>({...x,p:i}));
+  const control=buildTournamentScenarios(base,depth,controlCount*2,(seed+0xB7E15162)>>>0).slice(0,controlCount).map((x,i)=>({...x,p:i}));
   return{games:(contrast.length+control.length)*2,contrast,control,discoveredContrast:pool.length};
 }
 function runSharedDualTournament(candidate,base,depth,pool,seed){
   const contrast=tournamentOnScenarios(candidate,base,depth,pool.contrast,(seed+0x510E527F)>>>0);
   const control=tournamentOnScenarios(candidate,base,depth,pool.control,(seed+0x9B05688C)>>>0);
-  const candidateWins=contrast.candidateWins+control.candidateWins;
-  const baselineWins=contrast.baselineWins+control.baselineWins;
-  const draws=contrast.draws+control.draws;
-  const games=contrast.games+control.games;
-  const candidateScore=(candidateWins+0.5*draws)/Math.max(1,games);
-  return{
-    games,openingScenarios:contrast.openingScenarios+control.openingScenarios,
-    candidateWins,baselineWins,draws,candidateScore:Number(candidateScore.toFixed(4)),
-    contrast,control,totalNodes:contrast.totalNodes+control.totalNodes
-  };
+  const candidateWins=contrast.candidateWins+control.candidateWins,baselineWins=contrast.baselineWins+control.baselineWins,draws=contrast.draws+control.draws,games=contrast.games+control.games;
+  return{games,openingScenarios:contrast.openingScenarios+control.openingScenarios,candidateWins,baselineWins,draws,
+    candidateScore:Number(((candidateWins+0.5*draws)/Math.max(1,games)).toFixed(4)),contrast,control,totalNodes:contrast.totalNodes+control.totalNodes};
+}
+function aggregateStability(tours){
+  let cw=0,bw=0,d=0,kw=0,kb=0,kd=0,rw=0,rb=0,rd=0;
+  for(const t of tours){cw+=t.candidateWins;bw+=t.baselineWins;d+=t.draws;kw+=t.contrast.candidateWins;kb+=t.contrast.baselineWins;kd+=t.contrast.draws;rw+=t.control.candidateWins;rb+=t.control.baselineWins;rd+=t.control.draws;}
+  const score=(w,l,dr)=>(w+0.5*dr)/Math.max(1,w+l+dr);
+  const overall=score(cw,bw,d),contrast=score(kw,kb,kd),control=score(rw,rb,rd),seedScores=tours.map(t=>t.candidateScore);
+  const worstSeed=Math.min(...seedScores),poolFloor=Math.min(contrast,control),stabilityFloor=Math.min(worstSeed,poolFloor),stabilityScore=0.45*stabilityFloor+0.35*overall+0.20*poolFloor;
+  return{games:tours.reduce((z,t)=>z+t.games,0),candidateWins:cw,baselineWins:bw,draws:d,candidateScore:Number(overall.toFixed(4)),contrastScore:Number(contrast.toFixed(4)),controlScore:Number(control.toFixed(4)),worstSeed:Number(worstSeed.toFixed(4)),poolFloor:Number(poolFloor.toFixed(4)),stabilityFloor:Number(stabilityFloor.toFixed(4)),stabilityScore:Number(stabilityScore.toFixed(4)),seedScores:seedScores.map(x=>Number(x.toFixed(4)))};
+}
+function runMultiSeedStage(candidates,base,depth,gamesPerSeed,seeds,openingMap,label){
+  const pools=seeds.map(seed=>buildSharedDualPool(candidates,base,depth,gamesPerSeed,seed,openingMap));
+  const rows=candidates.map(c=>{const tours=pools.map((pool,i)=>runSharedDualTournament(c.weights,base,depth,pool,seeds[i]));return{...c,[label]:{aggregate:aggregateStability(tours),tours}};});
+  rows.sort((a,b)=>{const A=a[label].aggregate,B=b[label].aggregate;return B.stabilityFloor-A.stabilityFloor||B.stabilityScore-A.stabilityScore||B.candidateScore-A.candidateScore||B.poolFloor-A.poolFloor||(b.teacherExam?.teacherScore||0)-(a.teacherExam?.teacherScore||0);});
+  return{rows,pools};
 }
 
-console.log(`[v6.4] 当前基线 Gen${BASE_GENERATION}；候选 ${candidateSet.length} 个；Depth=${examDepth}；Seed=${baseSeed}`);
-console.log('[v6.4] 战术相位缩放：place=0.55, opening=0.75, capture=0.90, move=1.00');
+const started=Date.now();
+const openingMap=new Map();
+const priorOpeningPositions=loadPriorOpeningBook(openingMap);
+function approx(a,b,tol=0.0002){return Math.abs(Number(a)-Number(b))<=tol;}
+function assertExpectedBaseline(){
+  if(BASE_GENERATION!==4)throw new Error(`V6.5 冲 Gen5 要求正式基线仍为 Gen4；当前检测到 Gen${BASE_GENERATION}，已停止。`);
+  const expected={material:80.8132,mobility:30,protected:4.2116,pattern:18.7737,potential:5,center:8};
+  for(const [k,v] of Object.entries(expected))if(!approx(BASE_WEIGHTS[k],v,0.001))throw new Error(`V6.5 检测到 Gen4 基线参数 ${k}=${BASE_WEIGHTS[k]} 与预期 ${v} 不一致，已停止。`);
+}
+assertExpectedBaseline();
+if(cfg.games>=10&&cfg.depth!==4)throw new Error('V6.5 是深度4冲 Gen5 版：正式运行请把 Depth 选择为 4。');
+const realRun=cfg.games>=10,examDepth=realRun?4:Math.max(2,cfg.depth),baseSeed=cfg.seed>>>0;
+console.log(`[v6.5] 当前基线 Gen${BASE_GENERATION}；候选 ${candidateSet.length} 个；Depth=${examDepth}；Seed=${baseSeed}`);
+console.log('[v6.5] 战术相位缩放：place=0.35, opening=0.60, capture=0.85, move=1.00');
 
-// Stage 1：深度4老师考试。真实运行将 V6.3 失败局面与新候选分歧局面合并。
-const repair=repairScenarios();
+const repair63=linesToScenarios(V63_REPAIR_LINES,'v6.3-failure'),repair64=linesToScenarios(V64_REPAIR_LINES,'v6.4-failure');
 const screenDepth=realRun?3:2;
-const freshPack=buildDisagreementScenarios(
-  candidateSet,BASE_WEIGHTS,screenDepth,realRun?16:4,(baseSeed+0x13579BDF)>>>0
-);
-const teacherScenarios=uniqueScenarios([...repair,...freshPack.scenarios],realRun?24:6);
+const freshPack=buildDisagreementScenarios(candidateSet,BASE_WEIGHTS,screenDepth,realRun?20:6,(baseSeed+0x13579BDF)>>>0);
+const teacherScenarios=uniqueScenarios([...repair63,...repair64,...freshPack.scenarios],realRun?36:8);
 const teacherPack=teacherExamCandidates(candidateSet,BASE_WEIGHTS,teacherScenarios,screenDepth,examDepth);
-const teacherRanked=[...teacherPack.results].sort((a,b)=>
-  b.teacherExam.teacherScore-a.teacherExam.teacherScore ||
-  b.teacherExam.exactRate-a.teacherExam.exactRate ||
-  a.teacherExam.avgTeacherLoss-b.teacherExam.avgTeacherLoss
-);
-const stage1Count=realRun?5:Math.min(3,teacherRanked.length);
-const stage1=teacherRanked.slice(0,stage1Count);
-console.log(`[v6.4] Stage1 老师考试 ${teacherScenarios.length} 局面；入围：${stage1.map(x=>x.name).join(' / ')}`);
+const teacherRanked=[...teacherPack.results].sort((a,b)=>b.teacherExam.teacherScore-a.teacherExam.teacherScore||b.teacherExam.exactRate-a.teacherExam.exactRate||a.teacherExam.avgTeacherLoss-b.teacherExam.avgTeacherLoss);
+const stage1Target=realRun?6:Math.min(3,teacherRanked.length),stage1=[];
+const addStage1=c=>{if(c&&!stage1.some(x=>x.name===c.name)&&stage1.length<stage1Target)stage1.push(c);};
+for(const c of teacherRanked.slice(0,4))addStage1(c);addStage1(teacherRanked.find(x=>x.profile==='new-only'));addStage1(teacherRanked.find(x=>x.profile==='old-only'));for(const c of teacherRanked)addStage1(c);
+console.log(`[v6.5] Stage1 老师考试 ${teacherScenarios.length} 局面；入围：${stage1.map(x=>x.name).join(' / ')}`);
 
-// Stage 2：所有入围候选用完全相同的一套深度4双池小擂台。
-const stage2Games=realRun?20:4;
-const stage2Pool=buildSharedDualPool(stage1,BASE_WEIGHTS,examDepth,stage2Games,(baseSeed+0xBB67AE85)>>>0,openingMap);
-const stage2Rows=stage1.map((c,i)=>{
-  const tour=runSharedDualTournament(c.weights,BASE_WEIGHTS,examDepth,stage2Pool,(baseSeed+0x3C6EF372+i*17)>>>0);
-  const ss=scoreDualTour(tour);
-  return{...c,stage2:tour,stage2Floor:ss.floor,stage2Score:ss.selection};
-}).sort((a,b)=>
-  b.stage2Floor-a.stage2Floor || b.stage2Score-a.stage2Score ||
-  b.stage2.candidateScore-a.stage2.candidateScore ||
-  b.teacherExam.teacherScore-a.teacherExam.teacherScore
-);
-const stage2Count=realRun?2:Math.min(2,stage2Rows.length);
-const stage2Finalists=stage2Rows.slice(0,stage2Count);
-console.log(`[v6.4] Stage2 ${stage2Games}盘共享双池；入围：${stage2Finalists.map(x=>`${x.name} ${(x.stage2.candidateScore*100).toFixed(1)}%`).join(' / ')}`);
+const stage2Games=realRun?12:4;
+const stage2Seeds=realRun?[0xBB67AE85,0xA54FF53A,0x3C6EF372].map(x=>(baseSeed+x)>>>0):[(baseSeed+0xBB67AE85)>>>0];
+const stage2Pack=runMultiSeedStage(stage1,BASE_WEIGHTS,examDepth,stage2Games,stage2Seeds,openingMap,'stage2'),stage2Rows=stage2Pack.rows,stage2Finalists=stage2Rows.slice(0,realRun?2:Math.min(2,stage2Rows.length));
+console.log(`[v6.5] Stage2 多Seed稳定筛选：${stage2Seeds.length}×${stage2Games}盘；前二：${stage2Finalists.map(x=>`${x.name} 总${(x.stage2.aggregate.candidateScore*100).toFixed(1)}%/最差Seed${(x.stage2.aggregate.worstSeed*100).toFixed(1)}%/池底${(x.stage2.aggregate.poolFloor*100).toFixed(1)}%`).join(' / ')}`);
 
-// Stage 3：两个 finalist 再换一套完全独立共享双池，减少小样本偶然性。
-const stage3Games=realRun?40:4;
-const stage3Pool=buildSharedDualPool(stage2Finalists,BASE_WEIGHTS,examDepth,stage3Games,(baseSeed+0xA54FF53A)>>>0,openingMap);
-const stage3Rows=stage2Finalists.map((c,i)=>{
-  const tour=runSharedDualTournament(c.weights,BASE_WEIGHTS,examDepth,stage3Pool,(baseSeed+0x1F83D9AB+i*31)>>>0);
-  const ss=scoreDualTour(tour);
-  return{...c,stage3:tour,stage3Floor:ss.floor,stage3Score:ss.selection};
-}).sort((a,b)=>
-  b.stage3Floor-a.stage3Floor || b.stage3Score-a.stage3Score ||
-  b.stage3.candidateScore-a.stage3.candidateScore ||
-  b.stage2Floor-a.stage2Floor || b.teacherExam.teacherScore-a.teacherExam.teacherScore
-);
-const selected=stage3Rows[0];
-console.log(`[v6.4] Stage3 ${stage3Games}盘复核冠军：${selected.name}；总分 ${(selected.stage3.candidateScore*100).toFixed(1)}%；关键 ${(selected.stage3.contrast.candidateScore*100).toFixed(1)}%；随机 ${(selected.stage3.control.candidateScore*100).toFixed(1)}%`);
+const stage3Games=realRun?20:4;
+const stage3Seeds=realRun?[0x1F83D9AB,0x5BE0CD19].map(x=>(baseSeed+x)>>>0):[(baseSeed+0x1F83D9AB)>>>0];
+const stage3Pack=runMultiSeedStage(stage2Finalists,BASE_WEIGHTS,examDepth,stage3Games,stage3Seeds,openingMap,'stage3'),stage3Rows=stage3Pack.rows,selected=stage3Rows[0],s3=selected.stage3.aggregate;
+console.log(`[v6.5] Stage3 冠军：${selected.name}；总${(s3.candidateScore*100).toFixed(1)}%；关键${(s3.contrastScore*100).toFixed(1)}%；随机${(s3.controlScore*100).toFixed(1)}%；最差Seed${(s3.worstSeed*100).toFixed(1)}%`);
 
-// Final：只考冠军；全新 Seed，独立于前三个阶段。
-const finalExamGames=realRun?(cfg.games>=500?160:120):4;
-const finalSeed=(baseSeed+0x6A09E667)>>>0;
-const tour=buildPromotionTournament(
-  selected.weights,BASE_WEIGHTS,examDepth,finalExamGames,finalSeed,openingMap
-);
-tour.finalExam=true;
-tour.v64Champion=selected.name;
-tour.finalExamGames=finalExamGames;
-tour.finalExamDepth=examDepth;
-tour.acceptancePolicy={overallMin:0.55,contrastMin:0.50,controlMin:0.50,poolShare:'50/50',colorSwap:true};
-tour.accepted=Boolean(
-  tour.candidateScore>=0.55 && tour.contrast.candidateScore>=0.50 && tour.control.candidateScore>=0.50
-);
+const finalExamGames=realRun?(cfg.games>=500?160:120):4,finalSeed=(baseSeed+0xCBBB9D5D)>>>0;
+const tour=buildPromotionTournament(selected.weights,BASE_WEIGHTS,examDepth,finalExamGames,finalSeed,openingMap);
+tour.finalExam=true;tour.v65Champion=selected.name;tour.finalExamGames=finalExamGames;tour.finalExamDepth=examDepth;tour.acceptancePolicy={overallMin:0.55,contrastMin:0.50,controlMin:0.50,poolShare:'50/50',colorSwap:true,multiSeedSelection:true};
+tour.accepted=Boolean(tour.candidateScore>=0.55&&tour.contrast.candidateScore>=0.50&&tour.control.candidateScore>=0.50);
 
-const elapsed=(Date.now()-started)/1000;
-const openingBook=serializeOpeningBook(openingMap);
-const responsePoints=buildResponsePoints(openingBook);
-const generatedAt=new Date().toISOString();
-const engineConfig={
-  evaluatorVersion:'v6.4-phase-damped-tactics',
-  tacticalPhaseScale:{place:0.55,opening:0.75,capture:0.90,move:1.00}
-};
-const report={
-  version:'deep-train-v6.4-gen5-repair-shared-dual-final',rulesVersion:'V2.3-draw',baselineGeneration:BASE_GENERATION,
-  generatedAt,config:{...cfg,mode:'v6.4-gen5-repair-search',screenDepth,examDepth,stage2Games,stage3Games,finalExamGames},
-  elapsedSeconds:Number(elapsed.toFixed(3)),baselineWeights:BASE_WEIGHTS,engineConfig,
-  priorOpeningPositions,openingBookPositions:openingBook.length,
-  repairScenarioCount:repair.length,freshDisagreementScenarios:freshPack.scenarios.length,
-  teacherExam:{teacherDepth:teacherPack.teacherDepth,scenarios:teacherPack.scenarios,baseline:teacherPack.baseline},
-  candidates:teacherRanked.map(x=>({name:x.name,profile:x.profile,weights:x.weights,note:x.note,teacherExam:x.teacherExam})),
-  stage2:stage2Rows.map(x=>({name:x.name,weights:x.weights,floor:x.stage2Floor,selectionScore:x.stage2Score,tournament:x.stage2})),
-  stage3:stage3Rows.map(x=>({name:x.name,weights:x.weights,floor:x.stage3Floor,selectionScore:x.stage3Score,tournament:x.stage3})),
-  selected:{name:selected.name,profile:selected.profile,weights:selected.weights,note:selected.note},
-  tournament:tour
-};
+const elapsed=(Date.now()-started)/1000,openingBook=serializeOpeningBook(openingMap),responsePoints=buildResponsePoints(openingBook),generatedAt=new Date().toISOString();
+const engineConfig={evaluatorVersion:'v6.5-phase-damped-tactics',tacticalPhaseScale:{place:0.35,opening:0.60,capture:0.85,move:1.00}};
+const report={version:'deep-train-v6.5-multiseed-stability-final',rulesVersion:'V2.3-draw',baselineGeneration:BASE_GENERATION,generatedAt,config:{...cfg,mode:'v6.5-multiseed-stability',screenDepth,examDepth,stage2Games,stage2Seeds,stage3Games,stage3Seeds,finalExamGames,finalSeed},elapsedSeconds:Number(elapsed.toFixed(3)),baselineWeights:BASE_WEIGHTS,engineConfig,priorOpeningPositions,openingBookPositions:openingBook.length,repairScenarioCountV63:repair63.length,repairScenarioCountV64:repair64.length,freshDisagreementScenarios:freshPack.scenarios.length,teacherExam:{teacherDepth:teacherPack.teacherDepth,scenarios:teacherPack.scenarios,baseline:teacherPack.baseline},candidates:teacherRanked.map(x=>({name:x.name,profile:x.profile,weights:x.weights,note:x.note,teacherExam:x.teacherExam})),stage1:stage1.map(x=>x.name),stage2:stage2Rows.map(x=>({name:x.name,weights:x.weights,aggregate:x.stage2.aggregate,tournaments:x.stage2.tours})),stage3:stage3Rows.map(x=>({name:x.name,weights:x.weights,aggregate:x.stage3.aggregate,tournaments:x.stage3.tours})),selected:{name:selected.name,profile:selected.profile,weights:selected.weights,note:selected.note},tournament:tour};
 
 fs.mkdirSync('deep-train-results',{recursive:true});
 fs.writeFileSync('deep-train-results/deep-report.json',JSON.stringify(report,null,2));
-fs.writeFileSync('deep-train-results/openings.json',JSON.stringify({
-  version:'opening-book-v5',rulesVersion:'V2.3-draw',generatedAt,baselineWeights:BASE_WEIGHTS,positions:openingBook
-},null,2));
-fs.writeFileSync('deep-train-results/teaching-openings.json',JSON.stringify({
-  version:'teaching-openings-v1',rulesVersion:'V2.3-draw',generatedAt,lines:[],responsePoints
-},null,2));
-fs.writeFileSync('deep-train-results/teaching-openings.md',
-  '# 五道方 V6.4 Gen5 修复搜索\n\n本轮重点是参数修复与深度4晋级，不新增教学主线；累计开局库原样保留。\n'
-);
-fs.writeFileSync('deep-train-results/eval.json',JSON.stringify({
-  version:'eval-v6.4-repair',rulesVersion:'V2.3-draw',generatedAt,baseline:BASE_WEIGHTS,
-  candidate:selected.weights,engineConfig,accepted:tour.accepted,tournament:tour
-},null,2));
+fs.writeFileSync('deep-train-results/openings.json',JSON.stringify({version:'opening-book-v5',rulesVersion:'V2.3-draw',generatedAt,baselineWeights:BASE_WEIGHTS,positions:openingBook},null,2));
+fs.writeFileSync('deep-train-results/teaching-openings.json',JSON.stringify({version:'teaching-openings-v1',rulesVersion:'V2.3-draw',generatedAt,lines:[],responsePoints},null,2));
+fs.writeFileSync('deep-train-results/teaching-openings.md','# 五道方 V6.5 多Seed稳定选拔\n\n本轮重点是跨Seed稳定晋级，不新增教学主线；累计开局库原样保留。\n');
+fs.writeFileSync('deep-train-results/eval.json',JSON.stringify({version:'eval-v6.5-stability',rulesVersion:'V2.3-draw',generatedAt,baseline:BASE_WEIGHTS,candidate:selected.weights,engineConfig,accepted:tour.accepted,tournament:tour},null,2));
 const nextGeneration=tour.accepted?BASE_GENERATION+1:BASE_GENERATION;
-fs.writeFileSync('deep-train-results/next-baseline.json',JSON.stringify({
-  generation:nextGeneration,name:'Gen'+nextGeneration,rulesVersion:'V2.3-draw',generatedAt,
-  sourceTraining:{games:finalExamGames,depth:examDepth,seed:finalSeed,trainerVersion:report.version,mode:'v6.4-gen5-repair-search'},
-  accepted:tour.accepted,selectedCandidate:selected.name,
-  weights:tour.accepted?selected.weights:BASE_WEIGHTS,
-  engineConfig:tour.accepted?engineConfig:{evaluatorVersion:'gen4-legacy',tacticalPhaseScale:{place:1,opening:1,capture:1,move:1}},
-  promotionTest:tour
-},null,2));
-fs.writeFileSync('deep-train-results/candidate-screening.json',JSON.stringify({
-  version:'candidate-screening-v6.4-repair-shared-dual',baselineGeneration:BASE_GENERATION,baselineWeights:BASE_WEIGHTS,
-  engineConfig,selected:selected.name,repairScenarioCount:repair.length,
-  teacherQualified:stage1.map(x=>x.name),stage2Finalists:stage2Finalists.map(x=>x.name),
-  candidates:teacherRanked.map(x=>({name:x.name,profile:x.profile,weights:x.weights,note:x.note,teacherExam:x.teacherExam})),
-  stage2:stage2Rows.map(x=>({name:x.name,floor:x.stage2Floor,score:x.stage2Score,tournament:x.stage2})),
-  stage3:stage3Rows.map(x=>({name:x.name,floor:x.stage3Floor,score:x.stage3Score,tournament:x.stage3}))
-},null,2));
-fs.writeFileSync('deep-train-results/promotion-tournament.json',JSON.stringify({
-  version:'promotion-tournament-v6.4-independent-depth4-final',baselineGeneration:BASE_GENERATION,
-  selectedCandidate:selected.name,baselineWeights:BASE_WEIGHTS,candidateWeights:selected.weights,engineConfig,tournament:tour
-},null,2));
-
+fs.writeFileSync('deep-train-results/next-baseline.json',JSON.stringify({generation:nextGeneration,name:'Gen'+nextGeneration,rulesVersion:'V2.3-draw',generatedAt,sourceTraining:{games:finalExamGames,depth:examDepth,seed:finalSeed,trainerVersion:report.version,mode:'v6.5-multiseed-stability'},accepted:tour.accepted,selectedCandidate:selected.name,weights:tour.accepted?selected.weights:BASE_WEIGHTS,engineConfig:tour.accepted?engineConfig:{evaluatorVersion:'gen4-legacy',tacticalPhaseScale:{place:1,opening:1,capture:1,move:1}},promotionTest:tour},null,2));
+fs.writeFileSync('deep-train-results/candidate-screening.json',JSON.stringify({version:'candidate-screening-v6.5-multiseed-stability',baselineGeneration:BASE_GENERATION,baselineWeights:BASE_WEIGHTS,engineConfig,selected:selected.name,teacherQualified:stage1.map(x=>x.name),stage2:stage2Rows.map(x=>({name:x.name,aggregate:x.stage2.aggregate,tournaments:x.stage2.tours})),stage3:stage3Rows.map(x=>({name:x.name,aggregate:x.stage3.aggregate,tournaments:x.stage3.tours}))},null,2));
+fs.writeFileSync('deep-train-results/promotion-tournament.json',JSON.stringify({version:'promotion-tournament-v6.5-independent-depth4-final',baselineGeneration:BASE_GENERATION,selectedCandidate:selected.name,baselineWeights:BASE_WEIGHTS,candidateWeights:selected.weights,engineConfig,tournament:tour},null,2));
 const summary=[
-  '# 五道方 AI V6.4 · Gen5 修复搜索 + 深度4独立终审','',
-  `- 当前正式基线：Gen${BASE_GENERATION}`,
-  `- V6.3 失败修复局面：${repair.length} 个；新增候选分歧局面：${freshPack.scenarios.length} 个`,
-  `- 候选总数：${candidateSet.length}；老师考试后：${stage1.map(x=>x.name).join(' / ')}`,
-  `- 战术相位缩放：摆子55% / 满盘先掐75% / 掐子90% / 正常走棋100%`,
-  `- Stage2 共享双池：${stage2Games}盘；前二：${stage2Finalists.map(x=>`${x.name} ${(x.stage2.candidateScore*100).toFixed(1)}%`).join(' / ')}`,
-  `- Stage3 共享双池：${stage3Games}盘；冠军：${selected.name}`, 
-  `- 冠军参数：${JSON.stringify(selected.weights)}`,'',
-  '## 独立终审','',
-  `- Seed：${finalSeed}`,
-  `- 总对局：${tour.games}（全部交换黑白）`,
-  `- 关键对比池：候选 ${tour.contrast.candidateWins}胜 / 基线 ${tour.contrast.baselineWins}胜 / ${tour.contrast.draws}和；得分率 ${(tour.contrast.candidateScore*100).toFixed(1)}%`,
-  `- 随机池：候选 ${tour.control.candidateWins}胜 / 基线 ${tour.control.baselineWins}胜 / ${tour.control.draws}和；得分率 ${(tour.control.candidateScore*100).toFixed(1)}%`,
-  `- 总计：候选 ${tour.candidateWins}胜 / 基线 ${tour.baselineWins}胜 / ${tour.draws}和；总得分率 ${(tour.candidateScore*100).toFixed(1)}%`,
-  `- 晋级条件：总分≥55%，且关键池、随机池各≥50%`,
-  `- 是否升级：${tour.accepted?'是 → 自动生成 Gen'+(BASE_GENERATION+1):'否 → 保留 Gen'+BASE_GENERATION}`,
-  `- 总用时：${elapsed.toFixed(2)} 秒`,'',
-  '> V6.4 不降低晋级线，也不重复抽同一个候选的Seed。它先根据V6.3失败证据修参数，再用独立终审决定是否真正升Gen5。'
+  '# 五道方 AI V6.5 · 多Seed稳定选拔 + 深度4独立终审','',`- 当前正式基线：Gen${BASE_GENERATION}`,`- 候选总数：${candidateSet.length}；老师考试后：${stage1.map(x=>x.name).join(' / ')}`,`- 失败证据：V6.3=${repair63.length}个，V6.4=${repair64.length}个；新增分歧=${freshPack.scenarios.length}个`,`- 战术相位缩放：摆子35% / 满盘先掐60% / 掐子85% / 正常走棋100%`,`- Stage2：${stage2Seeds.length}个Seed × ${stage2Games}盘；前二：${stage2Finalists.map(x=>`${x.name} 总${(x.stage2.aggregate.candidateScore*100).toFixed(1)}%/最差Seed${(x.stage2.aggregate.worstSeed*100).toFixed(1)}%`).join(' / ')}`,`- Stage3：${stage3Seeds.length}个Seed × ${stage3Games}盘；冠军：${selected.name}`,`- Stage3冠军稳定性：总${(s3.candidateScore*100).toFixed(1)}% / 关键${(s3.contrastScore*100).toFixed(1)}% / 随机${(s3.controlScore*100).toFixed(1)}% / 最差Seed${(s3.worstSeed*100).toFixed(1)}%`,`- 冠军参数：${JSON.stringify(selected.weights)}`,'','## 独立终审','',`- Seed：${finalSeed}`,`- 总对局：${tour.games}（全部交换黑白）`,`- 关键对比池：候选 ${tour.contrast.candidateWins}胜 / 基线 ${tour.contrast.baselineWins}胜 / ${tour.contrast.draws}和；得分率 ${(tour.contrast.candidateScore*100).toFixed(1)}%`,`- 随机池：候选 ${tour.control.candidateWins}胜 / 基线 ${tour.control.baselineWins}胜 / ${tour.control.draws}和；得分率 ${(tour.control.candidateScore*100).toFixed(1)}%`,`- 总计：候选 ${tour.candidateWins}胜 / 基线 ${tour.baselineWins}胜 / ${tour.draws}和；总得分率 ${(tour.candidateScore*100).toFixed(1)}%`,`- 晋级条件：总分≥55%，且关键池、随机池各≥50%`,`- 是否升级：${tour.accepted?'是 → 自动生成 Gen'+(BASE_GENERATION+1):'否 → 保留 Gen'+BASE_GENERATION}`,`- 总用时：${elapsed.toFixed(2)} 秒`,'','> V6.5 的核心不是降低门槛，而是让候选先跨多个独立Seed稳定，再参加最后一次全新题终审，专门解决V6.3/V6.4的预筛过拟合。'
 ].join('\n');
-fs.writeFileSync('deep-train-results/summary.md',summary);
-console.log('\n'+summary);
+fs.writeFileSync('deep-train-results/summary.md',summary);console.log('\n'+summary);
