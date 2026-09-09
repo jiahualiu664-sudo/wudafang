@@ -9,6 +9,7 @@ on:
         default: '500'
         type: choice
         options:
+          - '4'
           - '200'
           - '500'
           - '2000'
