@@ -1,0 +1,94 @@
+name: 五道方 AI 深度训练
+
+on:
+  workflow_dispatch:
+    inputs:
+      games:
+        description: '深度训练对局数量'
+        required: true
+        default: '500'
+        type: choice
+        options:
+          - '200'
+          - '500'
+          - '2000'
+      depth:
+        description: '搜索深度（完整回合）'
+        required: true
+        default: '3'
+        type: choice
+        options:
+          - '2'
+          - '3'
+          - '4'
+      seed:
+        description: '随机种子（一般不用改）'
+        required: true
+        default: '20260905'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  deep_train:
+    name: 深度训练 ${{ inputs.games }} 局 · 深度 ${{ inputs.depth }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: 读取仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 开始深度训练
+        env:
+          GAMES: ${{ inputs.games }}
+          DEPTH: ${{ inputs.depth }}
+          SEED: ${{ inputs.seed }}
+        run: node trainer/deep_train.mjs --games "$GAMES" --depth "$DEPTH" --seed "$SEED"
+
+      - name: 累计开局经验并自动晋级
+        if: success()
+        run: |
+          mkdir -p data
+          cp deep-train-results/openings.json data/openings.json
+
+          if node -e "const fs=require('fs');const x=JSON.parse(fs.readFileSync('deep-train-results/next-baseline.json','utf8'));process.exit(x.accepted?0:1)"; then
+            cp deep-train-results/next-baseline.json data/ai-baseline.json
+            echo "候选通过擂台：已写入下一代正式基线"
+          else
+            echo "候选未通过擂台：保留当前正式基线"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/openings.json data/ai-baseline.json
+          if git diff --cached --quiet; then
+            echo "本轮没有需要提交的累计数据"
+          else
+            git commit -m "chore(ai): persist V5 training experience #${GITHUB_RUN_NUMBER}"
+            git push origin HEAD:main
+          fi
+
+      - name: 在任务摘要里显示结果
+        if: always()
+        run: |
+          if [ -f deep-train-results/summary.md ]; then
+            cat deep-train-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 保存深度训练结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wudaofang-deep-train-${{ inputs.games }}-d${{ inputs.depth }}
+          path: deep-train-results/
+          if-no-files-found: warn
+          retention-days: 30
