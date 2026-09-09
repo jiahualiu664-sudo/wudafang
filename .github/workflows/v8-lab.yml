@@ -1,0 +1,67 @@
+name: 五道方 V8 实验室
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'V8实验模式'
+        required: true
+        default: 'smoke'
+        type: choice
+        options:
+          - 'smoke'
+          - 'bench'
+      depth:
+        description: '实验搜索深度'
+        required: true
+        default: '2'
+        type: choice
+        options:
+          - '2'
+          - '3'
+      seed:
+        description: '随机种子'
+        required: true
+        default: '20260914'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  v8_lab:
+    name: V8 LAB · ${{ inputs.mode }} · 深度 ${{ inputs.depth }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 读取仓库
+        uses: actions/checkout@v4
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 运行 V8 实验
+        env:
+          MODE: ${{ inputs.mode }}
+          DEPTH: ${{ inputs.depth }}
+          SEED: ${{ inputs.seed }}
+        run: node trainer/v8_lab.mjs --mode "$MODE" --depth "$DEPTH" --seed "$SEED"
+
+      - name: 显示实验摘要
+        if: always()
+        run: |
+          if [ -f v8-lab-results/summary.md ]; then
+            cat v8-lab-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 保存实验结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wudaofang-v8-lab-${{ inputs.mode }}-d${{ inputs.depth }}
+          path: v8-lab-results/
+          if-no-files-found: warn
+          retention-days: 30
