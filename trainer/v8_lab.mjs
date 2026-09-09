@@ -18,7 +18,7 @@
 
 import fs from 'node:fs';
 
-const VERSION='v8-lab-c2-native-bridge-0.3';
+const VERSION='v8-lab-c3-budget-slim-0.4';
 const PHASE={PLACE:0,OPENING:1,MOVE:2,CAPTURE:3,GAMEOVER:4};
 const PHASE_NAME=['place','opening','move','capture','gameover'];
 const N=5;
@@ -433,34 +433,48 @@ function orderMoves(s,root,ctx,ttMove,ply){
   const aa=actions(s);
   if(aa.length<=1)return aa;
   const maximizing=s.turn===root;
-  const scored=[];
-  for(const a of aa){
-    let v=0,code=actionCode(a);
+  const cacheKey=hashState(s)+'|o|'+root;
+  let base=ctx.orderCache?.get(cacheKey);
+  if(!base){
+    base=[];
+    for(const a of aa){
+      let v=0;
+      if(a.type==='X')v+=5e7;
+      if(a.type==='P')v+=CENTER_W[a.to]*500;
+      if(a.type==='M')v+=(CENTER_W[a.to]-CENTER_W[a.from])*250;
+      const u=makeMove(s,a);
+      if(s.winner===root)v+=8e8;
+      if(s.winner===other(root))v-=8e8;
+      if(u.reward>0)v+=(maximizing?1:-1)*u.reward*8e7;
+      if(u.endedTurn&&!s.winner&&s.phase===PHASE.MOVE){
+        const lm=legalMoveCount(s,s.turn);
+        if(lm===1)v+=(maximizing?1:-1)*2e7;
+        if(lm===0)v+=(maximizing?1:-1)*7e8;
+      }
+      unmakeMove(s,u);
+      base.push({a,v,code:actionCode(a)});
+    }
+    if(ctx.orderCache&&ctx.orderCache.size<24000)ctx.orderCache.set(cacheKey,base);
+  }
+  const scored=base.map(x=>{
+    let v=x.v,code=x.code;
     if(code===ttMove)v+=1e9;
     if(ctx.killers[ply]?.includes(code))v+=3e7;
     v+=(ctx.history[code]||0);
-    if(a.type==='X')v+=5e7;
-    if(a.type==='P')v+=CENTER_W[a.to]*500;
-    if(a.type==='M')v+=(CENTER_W[a.to]-CENTER_W[a.from])*250;
-    const u=makeMove(s,a);
-    if(s.winner===root)v+=8e8;
-    if(s.winner===other(root))v-=8e8;
-    if(u.reward>0)v+=(maximizing?1:-1)*u.reward*8e7;
-    if(u.endedTurn&&!s.winner&&s.phase===PHASE.MOVE){
-      const lm=legalMoveCount(s,s.turn);
-      if(lm===1)v+=(maximizing?1:-1)*2e7;
-      if(lm===0)v+=(maximizing?1:-1)*7e8;
-    }
-    unmakeMove(s,u);
-    scored.push({a,v});
-  }
+    return{a:x.a,v};
+  });
   scored.sort((x,y)=>maximizing?y.v-x.v:x.v-y.v);
   return scored.map(x=>x.a);
 }
 
+function budgetHit(ctx){
+  if(ctx.nodes>=ctx.nodeLimit)return true;
+  if(ctx.deadline&&(ctx.nodes&31)===0&&Date.now()>=ctx.deadline)return true;
+  return false;
+}
 function qsearch(s,alpha,beta,root,ctx,noProgress,rep,qLeft,ply,sensitive){
   ctx.qnodes++;ctx.nodes++;
-  if(ctx.nodes>=ctx.nodeLimit||(ctx.deadline&&Date.now()>=ctx.deadline)){ctx.aborted=true;return evalFor(s,root);}
+  if(budgetHit(ctx)){ctx.aborted=true;return evalFor(s,root);}
   if(s.winner)return evalFor(s,root);
   let stand=evalFor(s,root);
   if(qLeft<=0)return stand;
@@ -469,13 +483,18 @@ function qsearch(s,alpha,beta,root,ctx,noProgress,rep,qLeft,ply,sensitive){
   if(maximizing){if(best>=beta)return best;if(best>alpha)alpha=best;}
   else{if(best<=alpha)return best;if(best<beta)beta=best;}
 
-  const tactical=[];
-  for(const a of actions(s)){
-    const u=makeMove(s,a);
-    if(u.critical)tactical.push({a,rank:(s.winner?1e9:0)+(a.type==='X'?1e7:0)+u.reward*1e6});
-    unmakeMove(s,u);
+  const qKey=hashState(s)+'|q';
+  let tactical=ctx.tacticalCache?.get(qKey);
+  if(!tactical){
+    tactical=[];
+    for(const a of actions(s)){
+      const u=makeMove(s,a);
+      if(u.critical)tactical.push({a,rank:(s.winner?1e9:0)+(a.type==='X'?1e7:0)+u.reward*1e6});
+      unmakeMove(s,u);
+    }
+    tactical.sort((a,b)=>b.rank-a.rank);
+    if(ctx.tacticalCache&&ctx.tacticalCache.size<24000)ctx.tacticalCache.set(qKey,tactical);
   }
-  tactical.sort((a,b)=>b.rank-a.rank);
   for(const x of tactical.slice(0,6)){
     const u=makeMove(s,x.a),step=pushDraw(null,x.a,s,u,noProgress,rep);
     let v;
@@ -495,7 +514,7 @@ function qsearch(s,alpha,beta,root,ctx,noProgress,rep,qLeft,ply,sensitive){
 function ttKey(s,root){return hashState(s)+'|r'+root;}
 function pvs(s,depth,alpha,beta,root,ctx,noProgress,rep,extLeft,ply,sensitive){
   ctx.nodes++;
-  if(ctx.nodes>=ctx.nodeLimit||(ctx.deadline&&Date.now()>=ctx.deadline)){ctx.aborted=true;return evalFor(s,root);}
+  if(budgetHit(ctx)){ctx.aborted=true;return evalFor(s,root);}
   if(s.winner)return evalFor(s,root);
   if(depth<=0)return ctx.useQ?qsearch(s,alpha,beta,root,ctx,noProgress,rep,ctx.qDepth,ply,sensitive):evalFor(s,root);
 
@@ -568,7 +587,7 @@ function pvs(s,depth,alpha,beta,root,ctx,noProgress,rep,extLeft,ply,sensitive){
 }
 
 function searchV8(s,targetDepth,root,opts={}){
-  const tt=new Map(),history=new Int32Array(131),killers=[];
+  const tt=new Map(),history=new Int32Array(131),killers=[],orderCache=new Map(),tacticalCache=new Map();
   const rep=new Map(opts.rep||[]);
   const noProgress=opts.noProgress||0;
   let completed=null,totalNodes=0,totalQ=0,totalExt=0,totalDraw=0;
@@ -576,13 +595,14 @@ function searchV8(s,targetDepth,root,opts={}){
   const deadline=opts.maxMs?Date.now()+opts.maxMs:0;
   for(let d=1;d<=targetDepth;d++){
     const ctx={
-      tt,history,killers,nodes:0,qnodes:0,extensions:0,drawLeaves:0,aborted:false,
+      tt,history,killers,orderCache,tacticalCache,nodes:0,qnodes:0,extensions:0,drawLeaves:0,aborted:false,
       nodeLimit,deadline,useQ:opts.useQ!==false,qDepth:opts.qDepth??2
     };
     const aa=orderMoves(s,root,ctx,completed?.bestCode??-1,0);
     const ranked=[];
-    let alpha=-Infinity,beta=Infinity;
+    let alpha=-Infinity,beta=Infinity,firstRoot=true;
     const maximizing=s.turn===root;
+    let bestEntry=null;
     for(const a of aa){
       const u=makeMove(s,a),step=pushDraw(null,a,s,u,noProgress,rep);
       let v;
@@ -590,16 +610,27 @@ function searchV8(s,targetDepth,root,opts={}){
       else{
         let nd=d-(u.endedTurn?1:0),extLeft=opts.extensions??1;
         if(u.endedTurn&&u.critical&&extLeft>0){nd++;extLeft--;ctx.extensions++;}
-        v=pvs(s,nd,-Infinity,Infinity,root,ctx,step.np,rep,extLeft,1,step.sensitive);
+        if(firstRoot){
+          v=pvs(s,nd,-Infinity,Infinity,root,ctx,step.np,rep,extLeft,1,step.sensitive);
+        }else if(maximizing){
+          v=pvs(s,nd,alpha,alpha+1,root,ctx,step.np,rep,extLeft,1,step.sensitive);
+          if(!ctx.aborted&&v>alpha)v=pvs(s,nd,alpha,beta,root,ctx,step.np,rep,extLeft,1,step.sensitive);
+        }else{
+          v=pvs(s,nd,beta-1,beta,root,ctx,step.np,rep,extLeft,1,step.sensitive);
+          if(!ctx.aborted&&v<beta)v=pvs(s,nd,alpha,beta,root,ctx,step.np,rep,extLeft,1,step.sensitive);
+        }
       }
       popDraw(step,rep);unmakeMove(s,u);
-      ranked.push({a,score:v,code:actionCode(a)});
+      const e={a,score:v,code:actionCode(a)};ranked.push(e);
       if(ctx.aborted)break;
+      firstRoot=false;
+      if(!bestEntry||(maximizing?v>bestEntry.score:v<bestEntry.score))bestEntry=e;
+      if(maximizing){if(v>alpha)alpha=v;}else{if(v<beta)beta=v;}
     }
     totalNodes+=ctx.nodes;totalQ+=ctx.qnodes;totalExt+=ctx.extensions;totalDraw+=ctx.drawLeaves;
-    if(ctx.aborted||ranked.length!==aa.length)break;
+    if(ctx.aborted||ranked.length!==aa.length||!bestEntry)break;
     ranked.sort((x,y)=>maximizing?y.score-x.score:x.score-y.score);
-    completed={depth:d,action:ranked[0].a,bestCode:ranked[0].code,score:ranked[0].score,ranked};
+    completed={depth:d,action:bestEntry.a,bestCode:bestEntry.code,score:bestEntry.score,ranked};
   }
   if(!completed){
     const aa=actions(s);const a=aa[0]||null;
@@ -1227,7 +1258,7 @@ function runNativeBridge(seed,depth,games){
     totalNodes:{v8:totalV8Nodes,native:totalNativeNodes},budgetCuts:{v8:totalV8Cuts,native:totalNativeCuts},
     v8Extensions:totalExt,v8QNodes:totalQ,elapsedMs:Date.now()-t0,
     scenarios:scenarios.map(x=>({id:x.id,plies:x.plies,phase:x.phase,turn:x.turn,hash:x.hash})),gamesDetail:rows,
-    interpretation:'V8-C2桥接：对手为从正式 deep_train.mjs 冻结的原生 Gen4/V6.5 searchRoot 语义；双方目标深度相同，V8使用与原生Gen4完全相同的单次时间/节点预算。仍是实验，不修改baseline。'
+    interpretation:'V8-C3性能瘦身：保留C2完整战术延伸/静态搜索语义；加入稀疏时间检查、根PVS、走法排序缓存与战术列表缓存。对手仍为冻结原生Gen4，预算完全相同。'
   };
 }
 
@@ -1307,7 +1338,7 @@ try{
     const arena=runNativeBridge(cfg.seed,cfg.depth,cfg.games);
     writeJson('bridge.json',{bridgeCheck,arena});
     writeSummary([
-      '# 五道方 V8-C2 · V8 vs 冻结原生Gen4','',
+      '# 五道方 V8-C3 · 性能瘦身版 vs 冻结原生Gen4','',
       `- 桥接自检：**${bridgeCheck.status}**（${bridgeCheck.samples}状态 / ${bridgeCheck.applyChecks}次apply）`,
       `- 对手：冻结原生 Gen4/V6.5 searchRoot`,
       `- 对局：${arena.games}盘（成对换边）`,
