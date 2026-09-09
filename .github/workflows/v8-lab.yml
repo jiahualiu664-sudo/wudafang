@@ -6,12 +6,14 @@ on:
       mode:
         description: 'V8实验模式'
         required: true
-        default: 'smoke'
+        default: 'bridgecheck'
         type: choice
         options:
           - 'smoke'
           - 'bench'
           - 'arena'
+          - 'bridgecheck'
+          - 'bridge'
       depth:
         description: '实验搜索深度'
         required: true
@@ -20,8 +22,9 @@ on:
         options:
           - '2'
           - '3'
+          - '4'
       games:
-        description: 'arena对局数（smoke/bench时忽略）'
+        description: '擂台对局数（自检模式忽略）'
         required: true
         default: '12'
         type: choice
@@ -30,10 +33,11 @@ on:
           - '12'
           - '20'
           - '40'
+          - '80'
       seed:
         description: '随机种子'
         required: true
-        default: '20260915'
+        default: '20260918'
         type: string
 
 permissions:
@@ -43,7 +47,7 @@ jobs:
   v8_lab:
     name: V8 LAB · ${{ inputs.mode }} · 深度 ${{ inputs.depth }} · ${{ inputs.games }}局
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: 读取仓库
