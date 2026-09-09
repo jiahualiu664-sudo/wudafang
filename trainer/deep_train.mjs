@@ -2,17 +2,17 @@
 'use strict';
 
 /*
-  五道方 V2.3 深度训练器 V6.5（多Seed稳定选拔 · 多池交叉验证 · 保守战术融合 · 深度4独立终审）
+  五道方 V2.3 深度训练器 V7.0（搜索引擎升级 · 和棋历史感知 · 战术延伸 · 开局经验先验 · Gen5终审）
 
-  V6.5 针对 V6.3 / V6.4 连续出现“预筛看起来强、独立终审掉回50%左右”的过拟合问题：
-  - 不再用单一共享池决定冠军，而是用多个互不重叠 Seed 的关键池 + 随机池交叉验证。
-  - 候选排序优先看“最差一次表现”和“关键/随机两类池的较弱一边”，避免只靠某一套题冲高分。
-  - 保留老师深搜考试，但额外强制保留“只调旧参数”和“极保守新棋理”方向，防止老师考试一家独大。
-  - 新棋理进一步保守：摆子35%，满盘先掐60%，掐子85%，正常走棋100%。Gen4 新三权重为0，因此不会偷偷改变正式Gen4。
-  - 候选范围从接近Gen4的超保守方案，到历史战术/威胁方向的中等幅度方案，避免再次只围绕同一个90%冠军打转。
-  - Stage2：3个独立Seed，每个12盘共享双池；Stage3：2个全新Seed，每个20盘共享双池。
-  - 最后只让跨Seed最稳定的单一冠军参加全新Seed的120盘深度4独立终审。
-  - 晋级标准不降低：总得分率>=55%，且关键池、随机池都>=50%，才自动写入Gen5。
+  V7.0 不再继续围绕 Gen4 微调评价权重，而是直接升级“怎么搜索”：
+  1) 正式候选继续使用 Gen4 的同一套六参数，避免把搜索收益和调参收益混在一起；
+  2) 候选搜索读取真实三次重复/100步无进展历史，临近和棋时能主动避和或保和；
+  3) 成型、掐子结束、困弊边缘等关键节点允许一次战术延伸，但仍受同一时间/节点预算约束；
+  4) 根节点和分支裁剪时保证关键战术着不会被普通排序挤掉；
+  5) 把累计 openings.json 当作“开局先验”：高访问、高置信的经验着进入搜索候选，并只在实时搜索认为近似等价时用于破同分；
+  6) Gen4 对手保留 V6.5 旧搜索；候选使用 V7.0 新搜索，同权重直接打擂台，因此若晋级，证明提升主要来自搜索引擎本身；
+  7) 先做多 Seed 小型体检，再做全新 Seed 的 120 盘深度4独立终审；
+  8) 晋级线不降低：总得分率 >=55%，关键池和随机池都 >=50%，才自动写入 Gen5。
 */
 
 import fs from 'node:fs';
@@ -456,6 +456,356 @@ function searchRoot(s,targetDepth,ai,w,wtag='base'){
   return{action:fallback[0].a,ranked:fallback,nodes:totalNodes,score:fallback[0].v,depth:0,budgetCut:true};
 }
 
+
+
+// ---------------- V7.0 搜索引擎候选 ----------------
+const LEGACY_ENGINE={
+  id:'gen4-v6.5-legacy-search',
+  drawAware:false,tacticalExtension:false,bookPrior:false,criticalRetention:false
+};
+const V7_ENGINE={
+  id:'v7.0-draw-book-tactical-search',
+  drawAware:true,tacticalExtension:true,bookPrior:true,criticalRetention:true,
+  maxExtensions:1,
+  bookMinStateVisits:8,
+  bookMinActionVisits:3,
+  bookMinPosterior:0.53,
+  bookMinMargin:0.018,
+  bookTieTolerance:42
+};
+
+function drawHistoryFromSequence(sequence,startState=null){
+  let s=newState(),noProgress=0,drawReason='';
+  const seen=new Map();
+  for(const t of sequence||[]){
+    const a=actions(s).find(x=>actionText(x)===t);
+    if(!a||s.winner||drawReason)break;
+    const before=s;
+    const claimedBefore=s.claimed[1].length+s.claimed[2].length;
+    const ns=apply(s,a);
+    const claimedAfter=ns.claimed[1].length+ns.claimed[2].length;
+    if(a.type==='capture')noProgress=0;
+    else if(a.type==='move')noProgress=claimedAfter>claimedBefore?0:noProgress+1;
+    s=ns;
+    if(!s.winner&&s.phase==='move'){
+      const k=repetitionKey(s),times=(seen.get(k)||0)+1;
+      seen.set(k,times);
+      if(times>=3)drawReason='threefold';
+      else if(noProgress>=100)drawReason='no-progress';
+    }
+  }
+  const matches=!startState||stateKey(s)===stateKey(startState);
+  return{state:s,seen,noProgress,drawReason,matches};
+}
+
+function bookInfoForState(s,openingMap,engine=V7_ENGINE){
+  if(!engine?.bookPrior||!openingMap)return null;
+  const rec=openingMap.get(stateKey(s));
+  if(!rec||rec.actor!==s.turn||rec.visits<engine.bookMinStateVisits)return null;
+  const legal=new Map(actions(s).map(a=>[actionText(a),a]));
+  const rows=[];
+  for(const [txt,a] of rec.actions||[]){
+    if(!legal.has(txt))continue;
+    const v=Math.max(0,Number(a.visits)||0);
+    if(v<engine.bookMinActionVisits)continue;
+    const wins=Number(a.wins)||0,draws=Number(a.draws)||0;
+    // Beta(2,2) 风格的保守平滑，避免低样本“100%胜率”误导。
+    const posterior=(wins+0.5*draws+2)/(v+4);
+    const avgEval=(Number(a.evalSum)||0)/Math.max(1,v);
+    const evalPrior=0.5+0.5*Math.tanh(avgEval/420);
+    const confidence=1-Math.exp(-v/7);
+    const score=0.72*posterior+0.18*evalPrior+0.10*(0.5+0.5*confidence);
+    rows.push({txt,action:legal.get(txt),visits:v,posterior,avgEval,score});
+  }
+  if(!rows.length)return null;
+  rows.sort((a,b)=>b.score-a.score||b.visits-a.visits);
+  const best=rows[0],second=rows[1]||null;
+  const margin=second?best.score-second.score:0.05;
+  const trusted=best.posterior>=engine.bookMinPosterior&&margin>=engine.bookMinMargin;
+  return{recVisits:rec.visits,best,second,margin,trusted};
+}
+
+function branchCapV7(s,depth){
+  if(s.phase==='place')return depth>=4?7:9;
+  if(s.phase==='move')return depth>=4?9:12;
+  if(s.phase==='capture'||s.phase==='opening')return 12;
+  return 12;
+}
+function isCriticalActionV7(s,a,ns=null){
+  ns=ns||apply(s,a);
+  if(ns.winner)return true;
+  if(a.type==='capture')return true;
+  if(a.type==='move'){
+    const beforeClaims=s.claimed[s.turn].length,afterClaims=ns.claimed[s.turn].length;
+    if(afterClaims>beforeClaims)return true;
+    if(ns.phase==='capture'&&ns.turn===s.turn)return true;
+    if(ns.phase==='move'&&ns.turn!==s.turn&&legalMoves(ns.board,ns.turn).length<=1)return true;
+  }
+  return false;
+}
+function orderedActionsV7(s,ai,w,depth,openingMap,engine=V7_ENGINE){
+  const aa=actions(s);
+  if(aa.length<=1)return aa;
+  const max=s.turn===ai;
+  const scored=aa.map(a=>{const ns=apply(s,a);return{a,ns,v:quickOrderScore(s,a,ai,w),critical:isCriticalActionV7(s,a,ns)}});
+  scored.sort((x,y)=>max?y.v-x.v:x.v-y.v);
+  const cap=branchCapV7(s,depth),picked=scored.slice(0,cap);
+  const chosen=new Set(picked.map(x=>actionText(x.a)));
+  // 即使静态排序不高，也保留少量立即成型/掐子/困弊关键着，避免分支裁剪把战术唯一解切掉。
+  for(const x of scored){
+    if(picked.length>=cap+1)break;
+    const t=actionText(x.a);
+    if(x.critical&&!chosen.has(t)){picked.push(x);chosen.add(t);}
+  }
+  const bi=bookInfoForState(s,openingMap,engine);
+  if(bi&&!chosen.has(bi.best.txt)){
+    const x=scored.find(q=>actionText(q.a)===bi.best.txt);
+    if(x){picked.push(x);chosen.add(bi.best.txt);}
+  }
+  picked.sort((x,y)=>max?y.v-x.v:x.v-y.v);
+  // 开局经验只改变搜索优先顺序，不直接覆盖实时搜索。
+  if(bi){
+    const i=picked.findIndex(x=>actionText(x.a)===bi.best.txt);
+    if(i>0){const [x]=picked.splice(i,1);picked.unshift(x);}
+  }
+  return picked.map(x=>x.a);
+}
+function tacticalExtensionV7(s,a,ns){
+  if(ns.winner)return false;
+  if(a.type==='capture'&&ns.phase==='move'&&ns.turn!==s.turn)return true;
+  if(a.type!=='move')return false;
+  if(ns.claimed[s.turn].length>s.claimed[s.turn].length)return true;
+  if(ns.phase==='capture'&&ns.turn===s.turn)return true;
+  if(ns.phase==='move'&&ns.turn!==s.turn&&legalMoves(ns.board,ns.turn).length<=1)return true;
+  return false;
+}
+function hasSensitiveRepetition(rep){for(const v of rep.values())if(v>=2)return true;return false;}
+function pushDrawContextV7(before,a,after,noProgress,ctx){
+  const claimedBefore=before.claimed[1].length+before.claimed[2].length;
+  const claimedAfter=after.claimed[1].length+after.claimed[2].length;
+  let np=noProgress;
+  if(a.type==='capture')np=0;
+  else if(a.type==='move')np=claimedAfter>claimedBefore?0:np+1;
+  let key=null,prev=0,draw=false;
+  if(!after.winner&&after.phase==='move'){
+    key=repetitionKey(after);prev=ctx.rep.get(key)||0;ctx.rep.set(key,prev+1);
+    if(prev+1>=3||np>=100)draw=true;
+  }
+  return{np,key,prev,draw,sensitive:np>=92||prev>=1};
+}
+function popDrawContextV7(step,ctx){
+  if(step.key==null)return;
+  if(step.prev>0)ctx.rep.set(step.key,step.prev);else ctx.rep.delete(step.key);
+}
+function quiescenceV7(s,ai,w,ctx,noProgress,qLeft,sensitive){
+  const stand=evalFor(s,ai,w);
+  if(qLeft<=0||s.winner)return stand;
+  const raw=actions(s),tactical=[];
+  for(const a of raw){
+    const ns=apply(s,a);
+    let critical=a.type==='capture'||ns.winner;
+    if(a.type==='move'){
+      if(ns.claimed[s.turn].length>s.claimed[s.turn].length)critical=true;
+      if(ns.phase==='capture'&&ns.turn===s.turn)critical=true;
+      if(ns.phase==='move'&&ns.turn!==s.turn&&legalMoves(ns.board,ns.turn).length<=1)critical=true;
+    }
+    if(critical)tactical.push({a,ns,v:quickOrderScore(s,a,ai,w)});
+  }
+  if(!tactical.length)return stand;
+  const maximizing=s.turn===ai;
+  tactical.sort((x,y)=>maximizing?y.v-x.v:x.v-y.v);
+  let best=stand;
+  for(const x of tactical.slice(0,3)){
+    const step=pushDrawContextV7(s,x.a,x.ns,noProgress,ctx);
+    let v;
+    if(step.draw){v=0;ctx.drawLeaves++;}
+    else{
+      ctx.extensions++;
+      // 只对同一回合连续掐子做一次极短稳定化；不再把整棵树多搜一层。
+      v=(x.ns.phase==='capture'&&x.ns.turn===s.turn&&qLeft>1)
+        ?quiescenceV7(x.ns,ai,w,ctx,step.np,qLeft-1,sensitive||step.sensitive)
+        :evalFor(x.ns,ai,w);
+    }
+    popDrawContextV7(step,ctx);
+    if(maximizing){if(v>best)best=v;}else{if(v<best)best=v;}
+  }
+  return best;
+}
+function alphabetaV7(s,depth,alpha,beta,ai,w,ctx,noProgress,extLeft,sensitive){
+  ctx.nodes++;
+  if((ctx.nodes&63)===0&&Date.now()>=ctx.deadline){ctx.aborted=true;return evalFor(s,ai,w);}
+  if(ctx.nodes>=ctx.maxNodes){ctx.aborted=true;return evalFor(s,ai,w);}
+  if(s.winner)return evalFor(s,ai,w);
+  if(depth<=0)return quiescenceV7(s,ai,w,ctx,noProgress,2,sensitive);
+  const useTT=!sensitive;
+  const k=useTT?hashKey(s,depth,ai,ctx.wtag+'-v7-e'+extLeft):null;
+  const old=useTT?ctx.tt.get(k):null;
+  if(old){
+    if(old.flag==='EXACT')return old.v;
+    if(old.flag==='LOWER')alpha=Math.max(alpha,old.v);else if(old.flag==='UPPER')beta=Math.min(beta,old.v);
+    if(alpha>=beta)return old.v;
+  }
+  const alpha0=alpha,beta0=beta,aa=orderedActionsV7(s,ai,w,depth,null,ctx.engine);
+  if(!aa.length)return evalFor(s,ai,w);
+  const maximizing=s.turn===ai;let best=maximizing?-Infinity:Infinity;
+  for(const a of aa){
+    const ns=apply(s,a);
+    const step=pushDrawContextV7(s,a,ns,noProgress,ctx);
+    let v;
+    if(step.draw){v=0;ctx.drawLeaves++;}
+    else{
+      const cost=(ns.winner||ns.turn!==s.turn)?1:0;
+      const nd=depth-cost;
+      v=alphabetaV7(ns,nd,alpha,beta,ai,w,ctx,step.np,extLeft,sensitive||step.sensitive);
+    }
+    popDrawContextV7(step,ctx);
+    if(maximizing){if(v>best)best=v;if(best>alpha)alpha=best;}
+    else{if(v<best)best=v;if(best<beta)beta=best;}
+    if(ctx.aborted||alpha>=beta)break;
+  }
+  if(useTT&&!ctx.aborted){
+    let flag='EXACT';if(best<=alpha0)flag='UPPER';else if(best>=beta0)flag='LOWER';
+    if(ctx.tt.size<ctx.maxTT)ctx.tt.set(k,{v:best,flag});
+  }
+  return best;
+}
+function searchRootV7(s,targetDepth,ai,w,wtag='v7',opts={}){
+  const engine=opts.engine||V7_ENGINE,openingMap=opts.openingMap||null;
+  const rootRep=new Map(opts.seen||[]),rootNoProgress=Number(opts.noProgress)||0;
+  const first=orderedActionsV7(s,ai,w,1,openingMap,engine);
+  if(!first.length)return{action:null,ranked:[],nodes:0,score:evalFor(s,ai,w),depth:0,budgetCut:false,bookUsed:false,extensions:0,drawLeaves:0};
+  const maxMs=targetDepth<=2?70:targetDepth===3?150:900;
+  const deadline=Date.now()+maxMs,maxNodes=targetDepth<=2?12000:targetDepth===3?30000:180000,maxTT=targetDepth<=2?4000:targetDepth===3?8000:36000;
+  let completed=null,totalNodes=0,budgetCut=false,totalExt=0,totalDrawLeaves=0;
+  const rootSensitive=rootNoProgress>=92||hasSensitiveRepetition(rootRep);
+  for(let depth=1;depth<=targetDepth;depth++){
+    const aa=orderedActionsV7(s,ai,w,depth,openingMap,engine);
+    const ctx={nodes:0,tt:new Map(),wtag,deadline,maxNodes,maxTT,aborted:false,rep:new Map(rootRep),openingMap,engine,extensions:0,drawLeaves:0};
+    const ranked=[];
+    for(const a of aa){
+      const ns=apply(s,a),step=pushDrawContextV7(s,a,ns,rootNoProgress,ctx);
+      let v;
+      if(step.draw){v=0;ctx.drawLeaves++;}
+      else{
+        const cost=(ns.winner||ns.turn!==s.turn)?1:0,extLeft=engine.maxExtensions||0;
+        v=alphabetaV7(ns,depth-cost,-Infinity,Infinity,ai,w,ctx,step.np,extLeft,rootSensitive||step.sensitive);
+      }
+      popDrawContextV7(step,ctx);
+      ranked.push({a,v});
+      if(ctx.aborted||Date.now()>=deadline)break;
+    }
+    totalNodes+=ctx.nodes;totalExt+=ctx.extensions;totalDrawLeaves+=ctx.drawLeaves;
+    if(!ctx.aborted&&ranked.length===aa.length){ranked.sort((x,y)=>y.v-x.v);completed={action:ranked[0].a,ranked,score:ranked[0].v,depth};}
+    else{budgetCut=true;break;}
+    if(Date.now()>=deadline)break;
+  }
+  const bi=bookInfoForState(s,openingMap,engine);
+  if(completed){
+    let chosen=completed.action,bookUsed=false;
+    if(bi?.trusted){
+      const hit=completed.ranked.find(x=>actionText(x.a)===bi.best.txt);
+      if(hit&&completed.ranked[0].v-hit.v<=engine.bookTieTolerance){chosen=hit.a;bookUsed=actionText(chosen)===bi.best.txt;}
+    }
+    return{...completed,action:chosen,nodes:totalNodes,budgetCut,bookUsed,bookInfo:bi?{visits:bi.recVisits,action:bi.best.txt,posterior:Number(bi.best.posterior.toFixed(4)),margin:Number(bi.margin.toFixed(4)),trusted:bi.trusted}:null,extensions:totalExt,drawLeaves:totalDrawLeaves};
+  }
+  let fallback=first.map(a=>({a,v:quickOrderScore(s,a,ai,w)})).sort((x,y)=>y.v-x.v),chosen=fallback[0].a,bookUsed=false;
+  if(bi?.trusted){const hit=fallback.find(x=>actionText(x.a)===bi.best.txt);if(hit){chosen=hit.a;bookUsed=true;}}
+  return{action:chosen,ranked:fallback,nodes:totalNodes,score:fallback[0].v,depth:0,budgetCut:true,bookUsed,extensions:totalExt,drawLeaves:totalDrawLeaves};
+}
+function updateDrawAfterActionLite(before,a,after,noProgress,rep){
+  const claimedBefore=before.claimed[1].length+before.claimed[2].length;
+  const claimedAfter=after.claimed[1].length+after.claimed[2].length;
+  let np=noProgress;
+  if(a.type==='capture')np=0;
+  else if(a.type==='move')np=claimedAfter>claimedBefore?0:np+1;
+  let key=null,prev=0,draw=false;
+  if(!after.winner&&after.phase==='move'){
+    key=repetitionKey(after);prev=rep.get(key)||0;rep.set(key,prev+1);
+    draw=prev+1>=3||np>=100;
+  }
+  return{np,key,prev,draw};
+}
+function rollbackDrawLite(step,rep){if(step.key==null)return;if(step.prev>0)rep.set(step.key,step.prev);else rep.delete(step.key);}
+function miniDrawValueV7(s,depth,ai,w,rep,noProgress,deadline){
+  if(Date.now()>=deadline||s.winner||depth<=0)return evalFor(s,ai,w);
+  const maximizing=s.turn===ai;
+  let aa=actions(s);
+  if(!aa.length)return evalFor(s,ai,w);
+  aa=aa.map(a=>({a,v:quickOrderScore(s,a,ai,w)})).sort((x,y)=>maximizing?y.v-x.v:x.v-y.v).slice(0,4).map(x=>x.a);
+  let best=maximizing?-Infinity:Infinity;
+  for(const a of aa){
+    const ns=apply(s,a),step=updateDrawAfterActionLite(s,a,ns,noProgress,rep);
+    let v;
+    if(step.draw)v=0;
+    else v=miniDrawValueV7(ns,depth-((ns.winner||ns.turn!==s.turn)?1:0),ai,w,rep,step.np,deadline);
+    rollbackDrawLite(step,rep);
+    if(maximizing){if(v>best)best=v;}else{if(v<best)best=v;}
+    if(Date.now()>=deadline)break;
+  }
+  return Number.isFinite(best)?best:evalFor(s,ai,w);
+}
+function evaluateExtraRootActionV7(s,a,depth,ai,w,wtag,deadlineMs=85){
+  const ns=apply(s,a);
+  if(ns.winner)return{v:evalFor(ns,ai,w),complete:true,nodes:0};
+  const deadline=Date.now()+deadlineMs;
+  const ctx={nodes:0,tt:new Map(),wtag:wtag+'-extra',deadline,maxNodes:18000,maxTT:5000,aborted:false};
+  const nd=Math.max(0,depth-((ns.winner||ns.turn!==s.turn)?1:0));
+  const v=alphabeta(ns,nd,-Infinity,Infinity,ai,w,ctx);
+  return{v,complete:!ctx.aborted,nodes:ctx.nodes};
+}
+function searchRootV7Lite(s,targetDepth,ai,w,wtag='v7-lite',opts={}){
+  const openingMap=opts.openingMap||null,engine=opts.engine||V7_ENGINE;
+  const base=searchRoot(s,targetDepth,ai,w,wtag+'-legacy-core');
+  if(!base.action)return{...base,bookUsed:false,extensions:0,drawLeaves:0};
+  const ranked=(base.ranked||[]).map(x=>({...x})),have=new Set(ranked.map(x=>actionText(x.a)));
+  const bi=bookInfoForState(s,openingMap,engine);
+  let extraNodes=0,extensions=0,drawLeaves=0;
+
+  // 根节点保留被旧分支上限裁掉的关键战术着与高置信开局着，最多额外检查2手。
+  const extras=[];
+  if(bi&&!have.has(bi.best.txt))extras.push(bi.best.action);
+  for(const a of actions(s)){
+    const t=actionText(a);if(have.has(t)||extras.some(x=>actionText(x)===t))continue;
+    if(isCriticalActionV7(s,a)&&extras.length<2)extras.push(a);
+  }
+  const verifyDepth=Math.max(1,Math.min(targetDepth,base.depth||targetDepth));
+  for(const a of extras.slice(0,2)){
+    const vr=evaluateExtraRootActionV7(s,a,Math.max(1,verifyDepth-1),ai,w,wtag,75);
+    extraNodes+=vr.nodes;
+    if(vr.complete){ranked.push({a,v:vr.v});have.add(actionText(a));extensions++;}
+  }
+
+  // 临近三次重复/100步和棋时，对前三候选做一个很小的真实历史校验。
+  const rep=new Map(opts.seen||[]),np=Number(opts.noProgress)||0;
+  const drawSensitive=np>=94||hasSensitiveRepetition(rep);
+  if(drawSensitive){
+    const deadline=Date.now()+55;
+    for(const row of ranked.slice(0,3)){
+      const ns=apply(s,row.a),step=updateDrawAfterActionLite(s,row.a,ns,np,rep);
+      if(step.draw){row.v=0;drawLeaves++;}
+      else{
+        const mv=miniDrawValueV7(ns,2-((ns.winner||ns.turn!==s.turn)?1:0),ai,w,rep,step.np,deadline);
+        // 只在小搜索明确看到“和棋值0”时覆盖，其他情况保留深度4主搜索判断。
+        if(Math.abs(mv)<1e-9){row.v=0;drawLeaves++;}
+      }
+      rollbackDrawLite(step,rep);
+      if(Date.now()>=deadline)break;
+    }
+  }
+
+  ranked.sort((x,y)=>y.v-x.v);
+  let chosen=ranked[0].a,bookUsed=false;
+  if(bi?.trusted){
+    const hit=ranked.find(x=>actionText(x.a)===bi.best.txt);
+    if(hit&&ranked[0].v-hit.v<=engine.bookTieTolerance){chosen=hit.a;bookUsed=true;}
+  }
+  return{action:chosen,ranked,nodes:(base.nodes||0)+extraNodes,score:ranked[0].v,depth:base.depth,budgetCut:base.budgetCut,bookUsed,bookInfo:bi?{visits:bi.recVisits,action:bi.best.txt,posterior:Number(bi.best.posterior.toFixed(4)),margin:Number(bi.margin.toFixed(4)),trusted:bi.trusted}:null,extensions,drawLeaves};
+}
+function searchRootEngine(s,targetDepth,ai,w,wtag,engine,opts={}){
+  if(engine?.id===V7_ENGINE.id)return searchRootV7Lite(s,targetDepth,ai,w,wtag,{...opts,engine});
+  return searchRoot(s,targetDepth,ai,w,wtag);
+}
+
 function mulberry32(seed){
   return function(){
     let t=seed+=0x6D2B79F5;
@@ -521,26 +871,32 @@ function outcomeBlack(winner,drawReason){
 
 function playGame({
   seed,depth,blackWeights,whiteWeights,explore=true,collect=true,
-  startState=null,diversityVisits=null
+  startState=null,startLine=null,diversityVisits=null,
+  blackEngine=LEGACY_ENGINE,whiteEngine=LEGACY_ENGINE,openingMap=null
 }){
   const rng=mulberry32(seed>>>0);
   let s=startState?clone(startState):newState();
-  let n=0,noProgress=0,drawReason='',turnChanges=0,totalNodes=0,budgetCuts=0;
-  const seen=new Map(),openingDecisions=[],samples=[],trace=[],lineActions=[];
+  const prior=startLine?.length?drawHistoryFromSequence(startLine,startState):null;
+  let n=0,noProgress=prior?.matches?prior.noProgress:0,drawReason='',turnChanges=0,totalNodes=0,budgetCuts=0,bookHits=0,searchExtensions=0,drawAwareLeaves=0;
+  const seen=prior?.matches?new Map(prior.seen):new Map(),openingDecisions=[],samples=[],trace=[],lineActions=[...(startLine||[])];
   let prevTurn=s.turn;
 
   while(!s.winner&&!drawReason&&n<cfg.maxActions){
     const actor=s.turn;
     const w=actor===1?blackWeights:whiteWeights;
     const wtag=actor===1?'B':'W';
+    const engine=actor===1?blackEngine:whiteEngine;
 
     if(collect&&s.phase==='move'&&samples.length<18&&n%3===0){
       samples.push(featuresBlack(s));
     }
 
-    const res=searchRoot(s,depth,actor,w,wtag);
+    const res=searchRootEngine(s,depth,actor,w,wtag,engine,{seen,noProgress,openingMap});
     totalNodes+=res.nodes;
     if(res.budgetCut)budgetCuts++;
+    if(res.bookUsed)bookHits++;
+    searchExtensions+=Number(res.extensions)||0;
+    drawAwareLeaves+=Number(res.drawLeaves)||0;
     if(!res.action)break;
 
     const repeatPressure=(seen.get(repetitionKey(s))||0)>=1 || noProgress>=24;
@@ -595,7 +951,7 @@ function playGame({
   if(!s.winner&&!drawReason)drawReason='safety-stop';
   return{
     winner:s.winner,drawReason,actions:n,turnChanges,totalNodes,
-    openingDecisions,samples,trace,finalState:s,budgetCuts
+    openingDecisions,samples,trace,finalState:s,budgetCuts,bookHits,searchExtensions,drawAwareLeaves
   };
 }
 
@@ -1428,6 +1784,106 @@ function buildPromotionTournament(candidate,base,depth,games,seed,openingMap){
 }
 
 
+function tournamentOnScenariosEngine(candidateEngine,baselineEngine,weights,depth,scenarios,seed,openingMap){
+  const targetGames=scenarios.length*2;
+  let candWins=0,baseWins=0,draws=0,totalNodes=0,bookHits=0,extensions=0,drawAwareLeaves=0,budgetCuts=0;
+  const scenarioSamples=[];
+  for(const sc of scenarios){
+    if(scenarioSamples.length<12)scenarioSamples.push({plies:sc.plies,line:sc.line,source:sc.source||'generated'});
+    for(const candBlack of [true,false]){
+      const r=playGame({
+        seed:(seed+0x9E3779B9+sc.p*2654435761+(candBlack?17:31))>>>0,
+        depth,
+        blackWeights:weights,whiteWeights:weights,
+        blackEngine:candBlack?candidateEngine:baselineEngine,
+        whiteEngine:candBlack?baselineEngine:candidateEngine,
+        openingMap,explore:false,collect:false,startState:sc.state,startLine:sc.line
+      });
+      totalNodes+=r.totalNodes;bookHits+=r.bookHits||0;extensions+=r.searchExtensions||0;drawAwareLeaves+=r.drawAwareLeaves||0;budgetCuts+=r.budgetCuts||0;
+      if(r.drawReason)draws++;
+      else{
+        const candWon=(candBlack&&r.winner===1)||(!candBlack&&r.winner===2);
+        if(candWon)candWins++;else baseWins++;
+      }
+    }
+  }
+  const score=(candWins+0.5*draws)/Math.max(1,targetGames);
+  return{
+    games:targetGames,openingScenarios:scenarios.length,candidateWins:candWins,baselineWins:baseWins,draws,
+    candidateScore:Number(score.toFixed(4)),accepted:score>=0.53,totalNodes,bookHits,extensions,drawAwareLeaves,budgetCuts,scenarioSamples
+  };
+}
+
+function inspectEngineScenario(sc,candidateEngine,baselineEngine,weights,depth,openingMap,tag){
+  const actor=sc.state.turn;
+  const hist=drawHistoryFromSequence(sc.line||[],sc.state);
+  const opts={seen:hist.matches?hist.seen:new Map(),noProgress:hist.matches?hist.noProgress:0,openingMap};
+  const bRes=searchRootEngine(sc.state,depth,actor,weights,tag+'-base',baselineEngine,opts);
+  const cRes=searchRootEngine(sc.state,depth,actor,weights,tag+'-cand',candidateEngine,opts);
+  return{...decisionContrast(bRes,cRes),bookUsed:!!cRes.bookUsed,candidateDepth:cRes.depth,baselineDepth:bRes.depth};
+}
+
+function buildEngineContrastScenarios(candidateEngine,baselineEngine,weights,tourDepth,games,seed,openingMap){
+  const targetGames=Math.max(2,games-(games%2)),targetScenarios=targetGames/2,probeDepth=Math.min(3,tourDepth);
+  const pool=[],seen=new Set();
+  const attempts=cfg.games<10?Math.max(8,targetScenarios*3):Math.max(48,targetScenarios*6);
+  function inspect(sc,source='generated',visits=0){
+    const sk=stateKey(sc.state);if(seen.has(sk)||sc.state.winner)return;seen.add(sk);
+    const contrast=inspectEngineScenario(sc,candidateEngine,baselineEngine,weights,probeDepth,openingMap,'engine-probe');
+    pool.push({p:pool.length,plies:sc.plies,state:sc.state,line:sc.line||[],source,visits,...contrast});
+  }
+  for(let a=0;a<attempts;a++){
+    const plies=8+(a%12)*3;
+    const sc=generateOpeningScenario((seed+0xD2511F53+a*2246822519)>>>0,tourDepth,weights,plies);
+    inspect({state:sc.state,line:sc.line,plies},'generated',0);
+  }
+  for(const h of historicalScenarioPool(openingMap,cfg.games<10?Math.max(8,targetScenarios*3):Math.max(72,targetScenarios*5)))inspect(h,'history',h.visits||0);
+  const typeWeight={hard:4,soft:3,'eval-gap':2,weak:1};
+  pool.sort((a,b)=>(typeWeight[b.type]||0)-(typeWeight[a.type]||0)||b.rank-a.rank||Number(b.bookUsed)-Number(a.bookUsed)||(b.visits||0)-(a.visits||0));
+  let selected=pool.filter(x=>x.type!=='weak').slice(0,targetScenarios);
+  if(selected.length<targetScenarios){
+    const used=new Set(selected.map(x=>stateKey(x.state)));
+    for(const x of pool){if(selected.length>=targetScenarios)break;const sk=stateKey(x.state);if(used.has(sk))continue;used.add(sk);selected.push(x);}
+  }
+  if(selected.length<targetScenarios){
+    const fill=buildTournamentScenarios(weights,tourDepth,(targetScenarios-selected.length)*2,(seed+0x243F6A88)>>>0);
+    const used=new Set(selected.map(x=>stateKey(x.state)));
+    for(const x of fill){if(selected.length>=targetScenarios)break;const sk=stateKey(x.state);if(used.has(sk))continue;used.add(sk);selected.push({...x,source:'fallback',type:'weak',rank:0,visits:0,bookUsed:false});}
+  }
+  selected=selected.slice(0,targetScenarios).map((x,i)=>({...x,p:i}));
+  const counts={hard:0,soft:0,evalGap:0,weak:0,history:0,generated:0,bookUsed:0};
+  for(const x of selected){
+    if(x.type==='hard')counts.hard++;else if(x.type==='soft')counts.soft++;else if(x.type==='eval-gap')counts.evalGap++;else counts.weak++;
+    if(x.source==='history')counts.history++;else counts.generated++;
+    if(x.bookUsed)counts.bookUsed++;
+  }
+  return{scenarios:selected,probeDepth,targetScenarios,attemptedPositions:seen.size,counts,qualifiedCount:selected.filter(x=>x.type!=='weak').length,poolSize:pool.length};
+}
+
+function buildEnginePromotionTournament(candidateEngine,baselineEngine,weights,depth,games,seed,openingMap){
+  const targetGames=Math.max(4,games-(games%2)),totalScenarios=targetGames/2;
+  const wantedContrastScenarios=Math.max(1,Math.round(totalScenarios*0.50));
+  const contrastPack=buildEngineContrastScenarios(candidateEngine,baselineEngine,weights,depth,wantedContrastScenarios*2,(seed+0x3C6EF372)>>>0,openingMap);
+  const contrastScenarios=contrastPack.scenarios;
+  const controlCount=Math.max(1,totalScenarios-contrastScenarios.length);
+  const controlScenarios=buildTournamentScenarios(weights,depth,controlCount*2,(seed+0xA54FF53A)>>>0).slice(0,controlCount).map((x,i)=>({...x,p:i,source:'control'}));
+  const contrast=contrastScenarios.length?tournamentOnScenariosEngine(candidateEngine,baselineEngine,weights,depth,contrastScenarios,(seed+0x510E527F)>>>0,openingMap):emptyTournamentResult();
+  const control=tournamentOnScenariosEngine(candidateEngine,baselineEngine,weights,depth,controlScenarios,(seed+0x9B05688C)>>>0,openingMap);
+  const candidateWins=contrast.candidateWins+control.candidateWins,baselineWins=contrast.baselineWins+control.baselineWins,draws=contrast.draws+control.draws,actualGames=contrast.games+control.games;
+  const score=(candidateWins+0.5*draws)/Math.max(1,actualGames),accepted=score>=0.55&&contrast.candidateScore>=0.50&&control.candidateScore>=0.50;
+  return{
+    games:actualGames,openingScenarios:contrast.openingScenarios+control.openingScenarios,candidateWins,baselineWins,draws,
+    candidateScore:Number(score.toFixed(4)),accepted,totalNodes:contrast.totalNodes+control.totalNodes,
+    bookHits:(contrast.bookHits||0)+(control.bookHits||0),extensions:(contrast.extensions||0)+(control.extensions||0),drawAwareLeaves:(contrast.drawAwareLeaves||0)+(control.drawAwareLeaves||0),budgetCuts:(contrast.budgetCuts||0)+(control.budgetCuts||0),
+    mode:'v7.0-engine-vs-gen4-legacy-50-50',acceptancePolicy:{overallMin:0.55,contrastMin:0.50,controlMin:0.50},
+    candidateEngine,baselineEngine,contrastTargetShare:0.50,contrastProbeDepth:contrastPack.probeDepth,contrastQualifiedScenarios:contrastPack.qualifiedCount,contrastCounts:contrastPack.counts,contrastPoolSize:contrastPack.poolSize,contrastAttemptedPositions:contrastPack.attemptedPositions,
+    contrast,control,contrastSamples:contrastScenarios.slice(0,16).map(sc=>({plies:sc.plies,line:sc.line,source:sc.source,type:sc.type,visits:sc.visits,baselineAction:sc.baselineAction,candidateAction:sc.candidateAction,bookUsed:sc.bookUsed,rank:sc.rank})),
+    scenarioSamples:[...contrast.scenarioSamples,...control.scenarioSamples].slice(0,12)
+  };
+}
+
+
+
 const HIST_TACTICAL35={
   material:80.513,mobility:30,protected:4.8525,pattern:18.3877,potential:5,center:8,
   threat:3.28,fork:2.86,constraint:0.908
@@ -1524,57 +1980,102 @@ const openingMap=new Map();
 const priorOpeningPositions=loadPriorOpeningBook(openingMap);
 function approx(a,b,tol=0.0002){return Math.abs(Number(a)-Number(b))<=tol;}
 function assertExpectedBaseline(){
-  if(BASE_GENERATION!==4)throw new Error(`V6.5 冲 Gen5 要求正式基线仍为 Gen4；当前检测到 Gen${BASE_GENERATION}，已停止。`);
+  if(BASE_GENERATION!==4)throw new Error(`V7.0 冲 Gen5 要求正式基线仍为 Gen4；当前检测到 Gen${BASE_GENERATION}，已停止。`);
   const expected={material:80.8132,mobility:30,protected:4.2116,pattern:18.7737,potential:5,center:8};
-  for(const [k,v] of Object.entries(expected))if(!approx(BASE_WEIGHTS[k],v,0.001))throw new Error(`V6.5 检测到 Gen4 基线参数 ${k}=${BASE_WEIGHTS[k]} 与预期 ${v} 不一致，已停止。`);
+  for(const [k,v] of Object.entries(expected))if(!approx(BASE_WEIGHTS[k],v,0.001))throw new Error(`V7.0 检测到 Gen4 基线参数 ${k}=${BASE_WEIGHTS[k]} 与预期 ${v} 不一致，已停止。`);
 }
 assertExpectedBaseline();
-if(cfg.games>=10&&cfg.depth!==4)throw new Error('V6.5 是深度4冲 Gen5 版：正式运行请把 Depth 选择为 4。');
+if(cfg.games>=10&&cfg.depth!==4)throw new Error('V7.0 是深度4搜索引擎冲 Gen5 版：正式运行请把 Depth 选择为 4。');
 const realRun=cfg.games>=10,examDepth=realRun?4:Math.max(2,cfg.depth),baseSeed=cfg.seed>>>0;
-console.log(`[v6.5] 当前基线 Gen${BASE_GENERATION}；候选 ${candidateSet.length} 个；Depth=${examDepth}；Seed=${baseSeed}`);
-console.log('[v6.5] 战术相位缩放：place=0.35, opening=0.60, capture=0.85, move=1.00');
+console.log(`[v7.0] 当前正式基线 Gen${BASE_GENERATION}；同权重引擎对决；Depth=${examDepth}；Seed=${baseSeed}`);
+console.log(`[v7.0] 基线引擎：${LEGACY_ENGINE.id}`);
+console.log(`[v7.0] 候选引擎：${V7_ENGINE.id}；和棋历史感知 + 一次战术延伸 + 关键着保留 + openings经验先验`);
+console.log(`[v7.0] 已载入开局经验局面：${priorOpeningPositions}`);
 
-const repair63=linesToScenarios(V63_REPAIR_LINES,'v6.3-failure'),repair64=linesToScenarios(V64_REPAIR_LINES,'v6.4-failure');
-const screenDepth=realRun?3:2;
-const freshPack=buildDisagreementScenarios(candidateSet,BASE_WEIGHTS,screenDepth,realRun?20:6,(baseSeed+0x13579BDF)>>>0);
-const teacherScenarios=uniqueScenarios([...repair63,...repair64,...freshPack.scenarios],realRun?36:8);
-const teacherPack=teacherExamCandidates(candidateSet,BASE_WEIGHTS,teacherScenarios,screenDepth,examDepth);
-const teacherRanked=[...teacherPack.results].sort((a,b)=>b.teacherExam.teacherScore-a.teacherExam.teacherScore||b.teacherExam.exactRate-a.teacherExam.exactRate||a.teacherExam.avgTeacherLoss-b.teacherExam.avgTeacherLoss);
-const stage1Target=realRun?6:Math.min(3,teacherRanked.length),stage1=[];
-const addStage1=c=>{if(c&&!stage1.some(x=>x.name===c.name)&&stage1.length<stage1Target)stage1.push(c);};
-for(const c of teacherRanked.slice(0,4))addStage1(c);addStage1(teacherRanked.find(x=>x.profile==='new-only'));addStage1(teacherRanked.find(x=>x.profile==='old-only'));for(const c of teacherRanked)addStage1(c);
-console.log(`[v6.5] Stage1 老师考试 ${teacherScenarios.length} 局面；入围：${stage1.map(x=>x.name).join(' / ')}`);
+// 多 Seed 小型体检只做稳定性诊断，不用来“挑候选”，因为 V7.0 只有一个预先固定的新搜索引擎。
+const precheckGames=realRun?20:4;
+const precheckSeeds=realRun?[0x6A09E667,0xBB67AE85].map(x=>(baseSeed+x)>>>0):[(baseSeed+0x6A09E667)>>>0];
+const prechecks=[];
+for(let i=0;i<precheckSeeds.length;i++){
+  const t=buildEnginePromotionTournament(V7_ENGINE,LEGACY_ENGINE,BASE_WEIGHTS,examDepth,precheckGames,precheckSeeds[i],openingMap);
+  prechecks.push(t);
+  console.log(`[v7.0] 体检Seed${i+1}: ${t.games}盘；总${(t.candidateScore*100).toFixed(1)}%；关键${(t.contrast.candidateScore*100).toFixed(1)}%；随机${(t.control.candidateScore*100).toFixed(1)}%；book=${t.bookHits||0}；延伸=${t.extensions||0}`);
+}
+const precheckAggregate=aggregateStability(prechecks);
+console.log(`[v7.0] 多Seed体检汇总：总${(precheckAggregate.candidateScore*100).toFixed(1)}%；关键${(precheckAggregate.contrastScore*100).toFixed(1)}%；随机${(precheckAggregate.controlScore*100).toFixed(1)}%；最差Seed${(precheckAggregate.worstSeed*100).toFixed(1)}%`);
 
-const stage2Games=realRun?12:4;
-const stage2Seeds=realRun?[0xBB67AE85,0xA54FF53A,0x3C6EF372].map(x=>(baseSeed+x)>>>0):[(baseSeed+0xBB67AE85)>>>0];
-const stage2Pack=runMultiSeedStage(stage1,BASE_WEIGHTS,examDepth,stage2Games,stage2Seeds,openingMap,'stage2'),stage2Rows=stage2Pack.rows,stage2Finalists=stage2Rows.slice(0,realRun?2:Math.min(2,stage2Rows.length));
-console.log(`[v6.5] Stage2 多Seed稳定筛选：${stage2Seeds.length}×${stage2Games}盘；前二：${stage2Finalists.map(x=>`${x.name} 总${(x.stage2.aggregate.candidateScore*100).toFixed(1)}%/最差Seed${(x.stage2.aggregate.worstSeed*100).toFixed(1)}%/池底${(x.stage2.aggregate.poolFloor*100).toFixed(1)}%`).join(' / ')}`);
-
-const stage3Games=realRun?20:4;
-const stage3Seeds=realRun?[0x1F83D9AB,0x5BE0CD19].map(x=>(baseSeed+x)>>>0):[(baseSeed+0x1F83D9AB)>>>0];
-const stage3Pack=runMultiSeedStage(stage2Finalists,BASE_WEIGHTS,examDepth,stage3Games,stage3Seeds,openingMap,'stage3'),stage3Rows=stage3Pack.rows,selected=stage3Rows[0],s3=selected.stage3.aggregate;
-console.log(`[v6.5] Stage3 冠军：${selected.name}；总${(s3.candidateScore*100).toFixed(1)}%；关键${(s3.contrastScore*100).toFixed(1)}%；随机${(s3.controlScore*100).toFixed(1)}%；最差Seed${(s3.worstSeed*100).toFixed(1)}%`);
-
-const finalExamGames=realRun?(cfg.games>=500?160:120):4,finalSeed=(baseSeed+0xCBBB9D5D)>>>0;
-const tour=buildPromotionTournament(selected.weights,BASE_WEIGHTS,examDepth,finalExamGames,finalSeed,openingMap);
-tour.finalExam=true;tour.v65Champion=selected.name;tour.finalExamGames=finalExamGames;tour.finalExamDepth=examDepth;tour.acceptancePolicy={overallMin:0.55,contrastMin:0.50,controlMin:0.50,poolShare:'50/50',colorSwap:true,multiSeedSelection:true};
+// 最终考试完全换新 Seed，避免把体检题当正式考试题。
+const finalExamGames=realRun?(cfg.games>=500?160:120):4;
+const finalSeed=(baseSeed+0xCBBB9D5D)>>>0;
+const tour=buildEnginePromotionTournament(V7_ENGINE,LEGACY_ENGINE,BASE_WEIGHTS,examDepth,finalExamGames,finalSeed,openingMap);
+tour.finalExam=true;tour.fixedEngineCandidate=true;tour.finalExamGames=finalExamGames;tour.finalExamDepth=examDepth;tour.precheckAggregate=precheckAggregate;
+tour.acceptancePolicy={overallMin:0.55,contrastMin:0.50,controlMin:0.50,poolShare:'50/50',colorSwap:true,independentFinalSeed:true,sameWeights:true};
 tour.accepted=Boolean(tour.candidateScore>=0.55&&tour.contrast.candidateScore>=0.50&&tour.control.candidateScore>=0.50);
 
 const elapsed=(Date.now()-started)/1000,openingBook=serializeOpeningBook(openingMap),responsePoints=buildResponsePoints(openingBook),generatedAt=new Date().toISOString();
-const engineConfig={evaluatorVersion:'v6.5-phase-damped-tactics',tacticalPhaseScale:{place:0.35,opening:0.60,capture:0.85,move:1.00}};
-const report={version:'deep-train-v6.5-multiseed-stability-final',rulesVersion:'V2.3-draw',baselineGeneration:BASE_GENERATION,generatedAt,config:{...cfg,mode:'v6.5-multiseed-stability',screenDepth,examDepth,stage2Games,stage2Seeds,stage3Games,stage3Seeds,finalExamGames,finalSeed},elapsedSeconds:Number(elapsed.toFixed(3)),baselineWeights:BASE_WEIGHTS,engineConfig,priorOpeningPositions,openingBookPositions:openingBook.length,repairScenarioCountV63:repair63.length,repairScenarioCountV64:repair64.length,freshDisagreementScenarios:freshPack.scenarios.length,teacherExam:{teacherDepth:teacherPack.teacherDepth,scenarios:teacherPack.scenarios,baseline:teacherPack.baseline},candidates:teacherRanked.map(x=>({name:x.name,profile:x.profile,weights:x.weights,note:x.note,teacherExam:x.teacherExam})),stage1:stage1.map(x=>x.name),stage2:stage2Rows.map(x=>({name:x.name,weights:x.weights,aggregate:x.stage2.aggregate,tournaments:x.stage2.tours})),stage3:stage3Rows.map(x=>({name:x.name,weights:x.weights,aggregate:x.stage3.aggregate,tournaments:x.stage3.tours})),selected:{name:selected.name,profile:selected.profile,weights:selected.weights,note:selected.note},tournament:tour};
+const engineConfig={
+  version:V7_ENGINE.id,
+  evaluatorVersion:'gen4-six-weight-eval',
+  drawAwareSearch:true,
+  tacticalExtension:{enabled:true,maxExtensions:V7_ENGINE.maxExtensions},
+  criticalMoveRetention:true,
+  openingBookPrior:{enabled:true,minStateVisits:V7_ENGINE.bookMinStateVisits,minActionVisits:V7_ENGINE.bookMinActionVisits,minPosterior:V7_ENGINE.bookMinPosterior,minMargin:V7_ENGINE.bookMinMargin,tieTolerance:V7_ENGINE.bookTieTolerance},
+  searchBudget:{depth4Ms:900,depth4Nodes:180000}
+};
+const legacyEngineConfig={version:LEGACY_ENGINE.id,evaluatorVersion:'gen4-six-weight-eval',drawAwareSearch:false,tacticalExtension:{enabled:false},criticalMoveRetention:false,openingBookPrior:{enabled:false},searchBudget:{depth4Ms:900,depth4Nodes:180000}};
+const report={
+  version:'deep-train-v7.0-search-engine-gen5-final',rulesVersion:'V2.3-draw',baselineGeneration:BASE_GENERATION,generatedAt,
+  config:{...cfg,mode:'v7.0-engine-vs-legacy',examDepth,precheckGames,precheckSeeds,finalExamGames,finalSeed},
+  elapsedSeconds:Number(elapsed.toFixed(3)),baselineWeights:BASE_WEIGHTS,candidateWeights:BASE_WEIGHTS,
+  candidateEngine:engineConfig,baselineEngine:legacyEngineConfig,priorOpeningPositions,openingBookPositions:openingBook.length,
+  prechecks:prechecks.map((t,i)=>({seed:precheckSeeds[i],tournament:t})),precheckAggregate,tournament:tour
+};
 
 fs.mkdirSync('deep-train-results',{recursive:true});
 fs.writeFileSync('deep-train-results/deep-report.json',JSON.stringify(report,null,2));
 fs.writeFileSync('deep-train-results/openings.json',JSON.stringify({version:'opening-book-v5',rulesVersion:'V2.3-draw',generatedAt,baselineWeights:BASE_WEIGHTS,positions:openingBook},null,2));
 fs.writeFileSync('deep-train-results/teaching-openings.json',JSON.stringify({version:'teaching-openings-v1',rulesVersion:'V2.3-draw',generatedAt,lines:[],responsePoints},null,2));
-fs.writeFileSync('deep-train-results/teaching-openings.md','# 五道方 V6.5 多Seed稳定选拔\n\n本轮重点是跨Seed稳定晋级，不新增教学主线；累计开局库原样保留。\n');
-fs.writeFileSync('deep-train-results/eval.json',JSON.stringify({version:'eval-v6.5-stability',rulesVersion:'V2.3-draw',generatedAt,baseline:BASE_WEIGHTS,candidate:selected.weights,engineConfig,accepted:tour.accepted,tournament:tour},null,2));
+fs.writeFileSync('deep-train-results/teaching-openings.md','# 五道方 V7.0 搜索引擎升级\n\n本轮不重新拟合评价权重；重点验证和棋历史感知、关键战术延伸与累计开局经验先验。累计开局库原样保留。\n');
+fs.writeFileSync('deep-train-results/eval.json',JSON.stringify({version:'eval-v7.0-engine-final',rulesVersion:'V2.3-draw',generatedAt,baseline:BASE_WEIGHTS,candidate:BASE_WEIGHTS,baselineEngine:legacyEngineConfig,candidateEngine:engineConfig,accepted:tour.accepted,tournament:tour},null,2));
 const nextGeneration=tour.accepted?BASE_GENERATION+1:BASE_GENERATION;
-fs.writeFileSync('deep-train-results/next-baseline.json',JSON.stringify({generation:nextGeneration,name:'Gen'+nextGeneration,rulesVersion:'V2.3-draw',generatedAt,sourceTraining:{games:finalExamGames,depth:examDepth,seed:finalSeed,trainerVersion:report.version,mode:'v6.5-multiseed-stability'},accepted:tour.accepted,selectedCandidate:selected.name,weights:tour.accepted?selected.weights:BASE_WEIGHTS,engineConfig:tour.accepted?engineConfig:{evaluatorVersion:'gen4-legacy',tacticalPhaseScale:{place:1,opening:1,capture:1,move:1}},promotionTest:tour},null,2));
-fs.writeFileSync('deep-train-results/candidate-screening.json',JSON.stringify({version:'candidate-screening-v6.5-multiseed-stability',baselineGeneration:BASE_GENERATION,baselineWeights:BASE_WEIGHTS,engineConfig,selected:selected.name,teacherQualified:stage1.map(x=>x.name),stage2:stage2Rows.map(x=>({name:x.name,aggregate:x.stage2.aggregate,tournaments:x.stage2.tours})),stage3:stage3Rows.map(x=>({name:x.name,aggregate:x.stage3.aggregate,tournaments:x.stage3.tours}))},null,2));
-fs.writeFileSync('deep-train-results/promotion-tournament.json',JSON.stringify({version:'promotion-tournament-v6.5-independent-depth4-final',baselineGeneration:BASE_GENERATION,selectedCandidate:selected.name,baselineWeights:BASE_WEIGHTS,candidateWeights:selected.weights,engineConfig,tournament:tour},null,2));
+fs.writeFileSync('deep-train-results/next-baseline.json',JSON.stringify({
+  generation:nextGeneration,name:'Gen'+nextGeneration,rulesVersion:'V2.3-draw',generatedAt,
+  sourceTraining:{games:finalExamGames,depth:examDepth,seed:finalSeed,trainerVersion:report.version,mode:'search-engine-upgrade'},
+  accepted:tour.accepted,selectedCandidate:'V7.0搜索引擎',weights:BASE_WEIGHTS,
+  engineConfig:tour.accepted?engineConfig:legacyEngineConfig,promotionTest:tour
+},null,2));
+fs.writeFileSync('deep-train-results/candidate-screening.json',JSON.stringify({
+  version:'candidate-screening-v7.0-fixed-engine-multiseed',baselineGeneration:BASE_GENERATION,baselineWeights:BASE_WEIGHTS,
+  candidate:'V7.0搜索引擎',candidateEngine:engineConfig,baselineEngine:legacyEngineConfig,
+  precheckSeeds,precheckGames,precheckAggregate,prechecks
+},null,2));
+fs.writeFileSync('deep-train-results/promotion-tournament.json',JSON.stringify({
+  version:'promotion-tournament-v7.0-engine-independent-depth4-final',baselineGeneration:BASE_GENERATION,
+  selectedCandidate:'V7.0搜索引擎',baselineWeights:BASE_WEIGHTS,candidateWeights:BASE_WEIGHTS,
+  baselineEngine:legacyEngineConfig,candidateEngine:engineConfig,tournament:tour
+},null,2));
+
 const summary=[
-  '# 五道方 AI V6.5 · 多Seed稳定选拔 + 深度4独立终审','',`- 当前正式基线：Gen${BASE_GENERATION}`,`- 候选总数：${candidateSet.length}；老师考试后：${stage1.map(x=>x.name).join(' / ')}`,`- 失败证据：V6.3=${repair63.length}个，V6.4=${repair64.length}个；新增分歧=${freshPack.scenarios.length}个`,`- 战术相位缩放：摆子35% / 满盘先掐60% / 掐子85% / 正常走棋100%`,`- Stage2：${stage2Seeds.length}个Seed × ${stage2Games}盘；前二：${stage2Finalists.map(x=>`${x.name} 总${(x.stage2.aggregate.candidateScore*100).toFixed(1)}%/最差Seed${(x.stage2.aggregate.worstSeed*100).toFixed(1)}%`).join(' / ')}`,`- Stage3：${stage3Seeds.length}个Seed × ${stage3Games}盘；冠军：${selected.name}`,`- Stage3冠军稳定性：总${(s3.candidateScore*100).toFixed(1)}% / 关键${(s3.contrastScore*100).toFixed(1)}% / 随机${(s3.controlScore*100).toFixed(1)}% / 最差Seed${(s3.worstSeed*100).toFixed(1)}%`,`- 冠军参数：${JSON.stringify(selected.weights)}`,'','## 独立终审','',`- Seed：${finalSeed}`,`- 总对局：${tour.games}（全部交换黑白）`,`- 关键对比池：候选 ${tour.contrast.candidateWins}胜 / 基线 ${tour.contrast.baselineWins}胜 / ${tour.contrast.draws}和；得分率 ${(tour.contrast.candidateScore*100).toFixed(1)}%`,`- 随机池：候选 ${tour.control.candidateWins}胜 / 基线 ${tour.control.baselineWins}胜 / ${tour.control.draws}和；得分率 ${(tour.control.candidateScore*100).toFixed(1)}%`,`- 总计：候选 ${tour.candidateWins}胜 / 基线 ${tour.baselineWins}胜 / ${tour.draws}和；总得分率 ${(tour.candidateScore*100).toFixed(1)}%`,`- 晋级条件：总分≥55%，且关键池、随机池各≥50%`,`- 是否升级：${tour.accepted?'是 → 自动生成 Gen'+(BASE_GENERATION+1):'否 → 保留 Gen'+BASE_GENERATION}`,`- 总用时：${elapsed.toFixed(2)} 秒`,'','> V6.5 的核心不是降低门槛，而是让候选先跨多个独立Seed稳定，再参加最后一次全新题终审，专门解决V6.3/V6.4的预筛过拟合。'
+  '# 五道方 AI V7.0 · 搜索引擎升级 + Gen5 深度4独立终审','',
+  `- 当前正式基线：Gen${BASE_GENERATION}`,
+  `- 双方评价权重完全相同：${JSON.stringify(BASE_WEIGHTS)}`,
+  `- 基线引擎：${LEGACY_ENGINE.id}`,
+  `- 候选引擎：${V7_ENGINE.id}`,
+  `- 候选新增：和棋历史感知 / 一次战术延伸 / 关键着保留 / openings高置信先验`,
+  `- 累计开局库：${openingBook.length}（历史载入 ${priorOpeningPositions}）`,'',
+  '## 多Seed体检','',
+  ...prechecks.map((t,i)=>`- Seed${i+1}=${precheckSeeds[i]}：${t.games}盘；总 ${(t.candidateScore*100).toFixed(1)}%；关键 ${(t.contrast.candidateScore*100).toFixed(1)}%；随机 ${(t.control.candidateScore*100).toFixed(1)}%`),
+  `- 汇总：总 ${(precheckAggregate.candidateScore*100).toFixed(1)}%；关键 ${(precheckAggregate.contrastScore*100).toFixed(1)}%；随机 ${(precheckAggregate.controlScore*100).toFixed(1)}%；最差Seed ${(precheckAggregate.worstSeed*100).toFixed(1)}%`,'',
+  '## 独立终审','',
+  `- Seed：${finalSeed}`,
+  `- 总对局：${tour.games}（全部交换黑白）`,
+  `- 关键对比池：候选 ${tour.contrast.candidateWins}胜 / 基线 ${tour.contrast.baselineWins}胜 / ${tour.contrast.draws}和；得分率 ${(tour.contrast.candidateScore*100).toFixed(1)}%`,
+  `- 随机池：候选 ${tour.control.candidateWins}胜 / 基线 ${tour.control.baselineWins}胜 / ${tour.control.draws}和；得分率 ${(tour.control.candidateScore*100).toFixed(1)}%`,
+  `- 总计：候选 ${tour.candidateWins}胜 / 基线 ${tour.baselineWins}胜 / ${tour.draws}和；总得分率 ${(tour.candidateScore*100).toFixed(1)}%`,
+  `- 候选开局先验采用次数：${tour.bookHits||0}；战术延伸节点：${tour.extensions||0}；和棋历史命中叶子：${tour.drawAwareLeaves||0}`,
+  `- 晋级条件：总分≥55%，且关键池、随机池各≥50%`,
+  `- 是否升级：${tour.accepted?'是 → 自动生成 Gen'+(BASE_GENERATION+1):'否 → 保留 Gen'+BASE_GENERATION}`,
+  `- 总用时：${elapsed.toFixed(2)} 秒`,'',
+  '> V7.0 不再靠调几个权重冲分。候选与Gen4使用同一评价参数，终审差异主要来自搜索、和棋历史处理和累计开局经验。'
 ].join('\n');
 fs.writeFileSync('deep-train-results/summary.md',summary);console.log('\n'+summary);
